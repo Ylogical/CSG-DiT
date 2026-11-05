@@ -1,5 +1,5 @@
 # --------------------------------------------------------
-# FASDiT: A Diffusion Transformer for Medical Image Segmentation.
+# CSGDiT: A Diffusion Transformer for Medical Image Segmentation.
 #
 # The diffusion process runs in the segmentation-mask space; the network is the
 # denoiser that predicts the clean mask x0 from a noisy mask x_t conditioned on
@@ -469,7 +469,7 @@ class DFCA(nn.Module):
         return self.proj(out)
 
 
-class FASDiTBlock(nn.Module):
+class CSGDiTBlock(nn.Module):
     """Transformer block with adaLN-Zero conditioning."""
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0):
         super().__init__()
@@ -491,7 +491,7 @@ class FASDiTBlock(nn.Module):
         return x
 
 
-class FASDiT_Segmentation(nn.Module):
+class CSGDiT_Segmentation(nn.Module):
 
     def __init__(
         self,
@@ -561,7 +561,7 @@ class FASDiT_Segmentation(nn.Module):
 
         # === Transformer blocks ===
         self.blocks = nn.ModuleList([
-            FASDiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio,
+            CSGDiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio,
                         attn_drop=attn_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0,
                         proj_drop=proj_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0)
             for i in range(depth)
@@ -690,47 +690,54 @@ class FASDiT_Segmentation(nn.Module):
 # Model variants
 # ============================================
 
-def FASDiT_S_16(**kwargs):
+def CSGDiT_S_16(**kwargs):
     """Small variant, patch_size=16 (4 blocks)."""
-    return FASDiT_Segmentation(depth=4, hidden_size=512, num_heads=8, patch_size=16, **kwargs)
+    return CSGDiT_Segmentation(depth=4, hidden_size=512, num_heads=8, patch_size=16, **kwargs)
 
-def FASDiT_S_32(**kwargs):
+def CSGDiT_S_32(**kwargs):
     """Small variant, patch_size=32."""
-    return FASDiT_Segmentation(depth=4, hidden_size=512, num_heads=8, patch_size=32, **kwargs)
+    return CSGDiT_Segmentation(depth=4, hidden_size=512, num_heads=8, patch_size=32, **kwargs)
 
-def FASDiT_B_16(**kwargs):
+def CSGDiT_B_16(**kwargs):
     """Base variant, patch_size=16 (6 blocks, tuned for small datasets)."""
-    return FASDiT_Segmentation(depth=6, hidden_size=768, num_heads=12, patch_size=16, **kwargs)
+    return CSGDiT_Segmentation(depth=6, hidden_size=768, num_heads=12, patch_size=16, **kwargs)
 
-def FASDiT_B_32(**kwargs):
+def CSGDiT_B_32(**kwargs):
     """Base variant, patch_size=32 (6 blocks, tuned for small datasets)."""
-    return FASDiT_Segmentation(depth=6, hidden_size=768, num_heads=12, patch_size=32, **kwargs)
+    return CSGDiT_Segmentation(depth=6, hidden_size=768, num_heads=12, patch_size=32, **kwargs)
 
-def FASDiT_L_16(**kwargs):
+def CSGDiT_L_16(**kwargs):
     """Large variant, patch_size=16 (8 blocks)."""
-    return FASDiT_Segmentation(depth=8, hidden_size=1024, num_heads=16, patch_size=16, **kwargs)
+    return CSGDiT_Segmentation(depth=8, hidden_size=1024, num_heads=16, patch_size=16, **kwargs)
 
-def FASDiT_L_32(**kwargs):
+def CSGDiT_L_32(**kwargs):
     """Large variant, patch_size=32 (8 blocks)."""
-    return FASDiT_Segmentation(depth=8, hidden_size=1024, num_heads=16, patch_size=32, **kwargs)
+    return CSGDiT_Segmentation(depth=8, hidden_size=1024, num_heads=16, patch_size=32, **kwargs)
 
-def FASDiT_H_16(**kwargs):
+def CSGDiT_H_16(**kwargs):
     """Huge variant, patch_size=16 (12 blocks)."""
-    return FASDiT_Segmentation(depth=12, hidden_size=1280, num_heads=16, patch_size=16, **kwargs)
+    return CSGDiT_Segmentation(depth=12, hidden_size=1280, num_heads=16, patch_size=16, **kwargs)
 
-def FASDiT_H_32(**kwargs):
+def CSGDiT_H_32(**kwargs):
     """Huge variant, patch_size=32 (12 blocks)."""
-    return FASDiT_Segmentation(depth=12, hidden_size=1280, num_heads=16, patch_size=32, **kwargs)
+    return CSGDiT_Segmentation(depth=12, hidden_size=1280, num_heads=16, patch_size=32, **kwargs)
 
 
 # Model registry
-FASDiT_models = {
-    'FASDiT-S/16': FASDiT_S_16,
-    'FASDiT-S/32': FASDiT_S_32,
-    'FASDiT-B/16': FASDiT_B_16,
-    'FASDiT-B/32': FASDiT_B_32,
-    'FASDiT-L/16': FASDiT_L_16,
-    'FASDiT-L/32': FASDiT_L_32,
-    'FASDiT-H/16': FASDiT_H_16,
-    'FASDiT-H/32': FASDiT_H_32,
+def normalize_model_name(name):
+    """Accept legacy checkpoint labels while using CSGDiT names internally."""
+    if name.startswith('FASDiT-'):
+        return 'CSGDiT-' + name[len('FASDiT-'):]
+    return name
+
+
+CSGDiT_models = {
+    'CSGDiT-S/16': CSGDiT_S_16,
+    'CSGDiT-S/32': CSGDiT_S_32,
+    'CSGDiT-B/16': CSGDiT_B_16,
+    'CSGDiT-B/32': CSGDiT_B_32,
+    'CSGDiT-L/16': CSGDiT_L_16,
+    'CSGDiT-L/32': CSGDiT_L_32,
+    'CSGDiT-H/16': CSGDiT_H_16,
+    'CSGDiT-H/32': CSGDiT_H_32,
 }

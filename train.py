@@ -1,5 +1,5 @@
 """
-FASDiT training entry point.
+CSGDiT training entry point.
 
 The model is trained from scratch (no pretrained weights) and relies on EMA,
 early stopping, weight decay and dropout for regularization.
@@ -25,7 +25,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from model_fas_dit import FASDiT_models
+from model_csg_dit import CSGDiT_models, normalize_model_name
 from dataset import get_dataloader_with_val, get_num_classes
 from diffusion_utils import DiffusionSchedule, compute_loss
 from training_logger import TrainingLogger
@@ -37,27 +37,27 @@ _DATASET_DEFAULTS = {
     # Small datasets: many epochs are needed for the diffusion model to
     # converge. Early stop after patience x metrics_eval_freq epochs without
     # improvement, but not before es_min_epochs.
-    'glas':    {'image_size': 256, 'model': 'FASDiT-B/16', 'batch_size': 8,
+    'glas':    {'image_size': 256, 'model': 'CSGDiT-B/16', 'batch_size': 8,
                 'lr': 2e-4, 'epochs': 20000, 'warmup_epochs': 50,
                 'patience': 20, 'metrics_eval_freq': 30, 'es_min_epochs': 10000,
                 'weight_decay': 0.05, 'attn_drop': 0.1, 'proj_drop': 0.1},
-    'ph2':     {'image_size': 256, 'model': 'FASDiT-B/16', 'batch_size': 8,
+    'ph2':     {'image_size': 256, 'model': 'CSGDiT-B/16', 'batch_size': 8,
                 'lr': 2e-4, 'epochs': 20000, 'warmup_epochs': 50,
                 'patience': 20, 'metrics_eval_freq': 30, 'es_min_epochs': 10000,
                 'weight_decay': 0.05, 'attn_drop': 0.1, 'proj_drop': 0.1},
-    'imid':    {'image_size': 256, 'model': 'FASDiT-B/16', 'batch_size': 4,
+    'imid':    {'image_size': 256, 'model': 'CSGDiT-B/16', 'batch_size': 4,
                 'lr': 2e-4, 'epochs': 20000, 'warmup_epochs': 50,
                 'patience': 20, 'metrics_eval_freq': 30, 'es_min_epochs': 10000,
                 'weight_decay': 0.05, 'attn_drop': 0.1, 'proj_drop': 0.1},
     # High-resolution nuclei dataset: 512x512 input with patch size 32.
-    'monuseg': {'image_size': 512, 'model': 'FASDiT-B/32', 'batch_size': 4,
+    'monuseg': {'image_size': 512, 'model': 'CSGDiT-B/32', 'batch_size': 4,
                 'lr': 1e-4, 'epochs': 20000, 'warmup_epochs': 60,
                 'patience': 20, 'metrics_eval_freq': 25, 'es_min_epochs': 10000,
                 'weight_decay': 0.05, 'attn_drop': 0.1, 'proj_drop': 0.1},
     # Multi-class abdominal CT: ~2200 training slices, so fewer epochs and
     # lighter regularization than the small binary sets. The standard split has
     # no validation set, hence the full schedule and no early stopping.
-    'synapse': {'image_size': 224, 'model': 'FASDiT-B/16', 'batch_size': 8,
+    'synapse': {'image_size': 224, 'model': 'CSGDiT-B/16', 'batch_size': 8,
                 'lr': 2e-4, 'epochs': 10000, 'warmup_epochs': 30,
                 'patience': 15, 'metrics_eval_freq': 20, 'es_min_epochs': 10000,
                 'weight_decay': 0.02, 'attn_drop': 0.05, 'proj_drop': 0.05,
@@ -135,7 +135,7 @@ class EarlyStopping:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Train FASDiT',
+        description='Train CSGDiT',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
@@ -155,8 +155,8 @@ Examples:
     parser.add_argument('--num_workers', type=int, default=4)
 
     # Model
-    parser.add_argument('--model', type=str, default=None,
-                        choices=list(FASDiT_models.keys()),
+    parser.add_argument('--model', type=normalize_model_name, default=None,
+                        choices=list(CSGDiT_models.keys()),
                         help='Model variant (default: B/16, monuseg=B/32)')
     parser.add_argument('--image_channels', type=int, default=3)
     parser.add_argument('--mask_channels', type=int, default=None,
@@ -480,7 +480,7 @@ def main():
 
     # Model
     print("Creating model...")
-    model = FASDiT_models[args.model](
+    model = CSGDiT_models[args.model](
         input_size=args.image_size,
         mask_channels=args.mask_channels,
         image_channels=args.image_channels,

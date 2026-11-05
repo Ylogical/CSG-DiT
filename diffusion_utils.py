@@ -1,5 +1,5 @@
 """
-Diffusion utilities for FASDiT.
+Diffusion utilities for CSGDiT.
 
 Mask-space diffusion with the cosine noise schedule, direct clean-mask
 prediction (x0) and deterministic DDIM sampling, as used in the paper.

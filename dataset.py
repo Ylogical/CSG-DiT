@@ -1,5 +1,5 @@
 """
-Dataset loaders for FASDiT.
+Dataset loaders for CSGDiT.
 
 Binary datasets (GlaS / MoNuSeg / PH2 / IMID / TNBC) follow the layout below,
 relative to the project root (see README.md):

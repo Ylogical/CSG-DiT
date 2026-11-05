@@ -1,4 +1,4 @@
-name: fas-dit
+name: csg-dit
 channels:
   - pytorch
   - nvidia

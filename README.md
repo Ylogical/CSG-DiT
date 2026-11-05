@@ -1,13 +1,14 @@
-# FAS-DiT
+# CSG-DiT
 
-Training and inference code for **FAS-DiT: Frequency-Adaptive Structure-Aware
-Diffusion Transformer for Medical Image Segmentation**.
+Training and inference code for **CSG-DiT: Frequency-Decoupled Condition and
+Uncertainty-Aware State Guidance in Diffusion Transformers for Medical Image
+Segmentation**.
 
 ## Installation
 
 ```bash
 conda env create -f environment.yaml
-conda activate fas-dit
+conda activate csg-dit
 ```
 
 Alternatively, with PyTorch already installed:

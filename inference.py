@@ -1,5 +1,5 @@
 """
-FASDiT inference and evaluation.
+CSGDiT inference and evaluation.
 
 Every test image is sampled K times with deterministic DDIM and the K soft
 predictions are averaged into an MMSE estimate.
@@ -30,7 +30,7 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 
-from model_fas_dit import FASDiT_models
+from model_csg_dit import CSGDiT_models, normalize_model_name
 from dataset import get_dataloader, get_num_classes, SynapseDataset
 from diffusion_utils import DiffusionSchedule
 
@@ -447,12 +447,12 @@ def run_inference_multiclass(model, diffusion, test_loader, device, args):
 # CLI
 # ----------------------------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description='FASDiT inference')
+    p = argparse.ArgumentParser(description='CSGDiT inference')
     p.add_argument('--checkpoint',     type=str, required=True)
     p.add_argument('--dataset',        type=str, default='glas',
                    choices=['glas', 'monuseg', 'ph2', 'imid', 'tnbc', 'synapse'])
-    p.add_argument('--model',          type=str, default=None,
-                   choices=list(FASDiT_models.keys()),
+    p.add_argument('--model',          type=normalize_model_name, default=None,
+                   choices=list(CSGDiT_models.keys()),
                    help='Model variant (default: read from the checkpoint, else B/16)')
     p.add_argument('--image_size',     type=int, default=None,
                    help='Input size (default: glas/ph2/imid=256, monuseg/tnbc=512, '
@@ -498,6 +498,8 @@ def main():
     print(f"Loading checkpoint from {args.checkpoint}...")
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     cfg = ckpt.get('train_config', {})
+    if 'model' in cfg:
+        cfg = dict(cfg, model=normalize_model_name(cfg['model']))
     if cfg:
         print("\n[Checkpoint train config]")
         for k, v in cfg.items():
@@ -505,7 +507,7 @@ def main():
         print()
 
     if args.model is None:
-        args.model = cfg.get('model', 'FASDiT-B/16')
+        args.model = cfg.get('model', 'CSGDiT-B/16')
     elif 'model' in cfg and cfg['model'] != args.model:
         raise RuntimeError(f"--model {args.model} but the checkpoint was trained with "
                            f"{cfg['model']}; the architectures do not match.")
@@ -526,7 +528,7 @@ def main():
 
     # Model
     print(f"Creating model {args.model} @ {args.image_size}x{args.image_size}...")
-    model = FASDiT_models[args.model](
+    model = CSGDiT_models[args.model](
         input_size=args.image_size,
         mask_channels=args.mask_channels,
         image_channels=args.image_channels,
