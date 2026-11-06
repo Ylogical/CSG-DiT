@@ -1,24 +1,104 @@
-# --------------------------------------------------------
-# CSGDiT: A Diffusion Transformer for Medical Image Segmentation.
-#
-# The diffusion process runs in the segmentation-mask space; the network is the
-# denoiser that predicts the clean mask x0 from a noisy mask x_t conditioned on
-# the medical image.
-#
-#   MS-DSE encoder (image / noisy mask, dual stream, multi-scale)
-#     -> DiT backbone over mask tokens (self-attention + 2D RoPE + adaLN-Zero)
-#     -> DFCA + PBDF frequency-decoupled condition injection after every block
-#     -> MS-DSE decoder (symmetric U-shaped, dual-stream skips) -> x0_hat
-#
-# The image condition reaches the mask stream through DFCA only: the
-# conditioning vector c carries the timestep, and image tokens never enter the
-# backbone self-attention.
-# --------------------------------------------------------
+import math
+
+import numpy as np
 import torch
 import torch.nn as nn
-import math
 import torch.nn.functional as F
-from util.model_util import VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed, RMSNorm
+from einops import rearrange, repeat
+
+
+def broadcat(tensors, dim = -1):
+    num_tensors = len(tensors)
+    shape_lens = set(list(map(lambda t: len(t.shape), tensors)))
+    assert len(shape_lens) == 1, 'tensors must all have the same number of dimensions'
+    shape_len = list(shape_lens)[0]
+    dim = (dim + shape_len) if dim < 0 else dim
+    dims = list(zip(*map(lambda t: list(t.shape), tensors)))
+    expandable_dims = [(i, val) for i, val in enumerate(dims) if i != dim]
+    assert all([*map(lambda t: len(set(t[1])) <= 2, expandable_dims)]), 'invalid dimensions for broadcastable concatentation'
+    max_dims = list(map(lambda t: (t[0], max(t[1])), expandable_dims))
+    expanded_dims = list(map(lambda t: (t[0], (t[1],) * num_tensors), max_dims))
+    expanded_dims.insert(dim, (dim, dims[dim]))
+    expandable_shapes = list(zip(*map(lambda t: t[1], expanded_dims)))
+    tensors = list(map(lambda t: t[0].expand(*t[1]), zip(tensors, expandable_shapes)))
+    return torch.cat(tensors, dim = dim)
+
+
+def rotate_half(x):
+    x = rearrange(x, '... (d r) -> ... d r', r = 2)
+    x1, x2 = x.unbind(dim = -1)
+    x = torch.stack((-x2, x1), dim = -1)
+    return rearrange(x, '... d r -> ... (d r)')
+
+
+class VisionRotaryEmbeddingFast(nn.Module):
+    def __init__(self, dim, pt_seq_len, theta=10000):
+        super().__init__()
+        freqs = 1. / (theta ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim))
+        t = torch.arange(pt_seq_len).float()
+
+        freqs = torch.einsum('..., f -> ... f', t, freqs)
+        freqs = repeat(freqs, '... n -> ... (n r)', r = 2)
+        freqs = broadcat((freqs[:, None, :], freqs[None, :, :]), dim = -1)
+
+        self.register_buffer('freqs_cos', freqs.cos().view(-1, freqs.shape[-1]))
+        self.register_buffer('freqs_sin', freqs.sin().view(-1, freqs.shape[-1]))
+
+    def forward(self, t):
+        return t * self.freqs_cos + rotate_half(t) * self.freqs_sin
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return (self.weight * hidden_states).to(input_dtype)
+
+
+def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
+    grid_h = np.arange(grid_size, dtype=np.float32)
+    grid_w = np.arange(grid_size, dtype=np.float32)
+    grid = np.meshgrid(grid_w, grid_h)
+    grid = np.stack(grid, axis=0)
+
+    grid = grid.reshape([2, 1, grid_size, grid_size])
+    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
+    if cls_token and extra_tokens > 0:
+        pos_embed = np.concatenate([np.zeros([extra_tokens, embed_dim]), pos_embed], axis=0)
+    return pos_embed
+
+
+def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
+    assert embed_dim % 2 == 0
+
+    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])
+    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])
+
+    emb = np.concatenate([emb_h, emb_w], axis=1)
+    return emb
+
+
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+    assert embed_dim % 2 == 0
+    omega = np.arange(embed_dim // 2, dtype=np.float64)
+    omega /= embed_dim / 2.
+    omega = 1. / 10000**omega
+
+    pos = pos.reshape(-1)
+    out = np.einsum('m,d->md', pos, omega)
+
+    emb_sin = np.sin(out)
+    emb_cos = np.cos(out)
+
+    emb = np.concatenate([emb_sin, emb_cos], axis=1)
+    return emb
 
 
 def modulate(x, shift, scale):
@@ -26,7 +106,6 @@ def modulate(x, shift, scale):
 
 
 class TimestepEmbedder(nn.Module):
-    """Timestep embedder: maps a scalar timestep to a vector."""
     def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
         self.mlp = nn.Sequential(
@@ -38,7 +117,6 @@ class TimestepEmbedder(nn.Module):
 
     @staticmethod
     def timestep_embedding(t, dim, max_period=10000):
-        """Sinusoidal timestep embedding."""
         half = dim // 2
         freqs = torch.exp(
             -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
@@ -60,7 +138,6 @@ def scaled_dot_product_attention(query, key, value, dropout_p=0.0) -> torch.Tens
 
 
 class Attention(nn.Module):
-    """Multi-head self-attention."""
     def __init__(self, dim, num_heads=8, qkv_bias=True, qk_norm=True, attn_drop=0., proj_drop=0.):
         super().__init__()
         self.num_heads = num_heads
@@ -97,7 +174,6 @@ class Attention(nn.Module):
 
 
 class SwiGLUFFN(nn.Module):
-    """SwiGLU feed-forward network."""
     def __init__(
         self,
         dim: int,
@@ -118,13 +194,7 @@ class SwiGLUFFN(nn.Module):
         return self.w3(self.ffn_dropout(hidden))
 
 
-# ============================================================
-# MS-DSE encoding path: one multi-scale CNN branch
-# (Spatial Structure Enhancement, Sec. III-C of the paper)
-# ============================================================
-
 class ConvBlock(nn.Module):
-    """Double convolution block: (Conv-GN-GELU) x 2."""
     def __init__(self, in_ch, out_ch):
         super().__init__()
         self.block = nn.Sequential(
@@ -141,53 +211,39 @@ class ConvBlock(nn.Module):
 
 
 class MultiScaleEncoder(nn.Module):
-    """One MS-DSE encoding branch (E_img or E_msk).
-
-    Cascaded Conv-GroupNorm-GELU blocks with downsampling produce a feature
-    pyramid {f1, f2, f3} used as decoder skips, and the last stage is pooled and
-    projected into N = (H/p)^2 backbone tokens.
-    """
     def __init__(self, in_chans=3, hidden_size=768, patch_size=16, input_size=256):
         super().__init__()
         self.patch_size = patch_size
         self.input_size = input_size
         D = hidden_size
 
-        self.enc1 = ConvBlock(in_chans, 64)             # H x W, 64ch
-        self.down1 = nn.Conv2d(64, 128, 2, 2)           # H/2 x W/2
+        self.enc1 = ConvBlock(in_chans, 64)
+        self.down1 = nn.Conv2d(64, 128, 2, 2)
 
-        self.enc2 = ConvBlock(128, 256)                  # H/2 x W/2, 256ch
-        self.down2 = nn.Conv2d(256, 512, 2, 2)          # H/4 x W/4
+        self.enc2 = ConvBlock(128, 256)
+        self.down2 = nn.Conv2d(256, 512, 2, 2)
 
-        self.enc3 = ConvBlock(512, D)                    # H/4 x W/4, D ch
+        self.enc3 = ConvBlock(512, D)
 
-        # enc1..down2 downsample by 4x, to_tokens by another patch_size//4.
-        # AvgPool + 1x1 Conv instead of a large strided conv, so the parameter
-        # count does not grow with the square of patch_size.
         stride = patch_size // 4
         self.to_tokens = nn.Sequential(
             nn.AvgPool2d(kernel_size=stride, stride=stride),
             nn.Conv2d(D, D, kernel_size=1),
         )
 
-        self.skip_channels = [64, 256, D]                # [f1_ch, f2_ch, f3_ch]
+        self.skip_channels = [64, 256, D]
         self.num_patches = (input_size // patch_size) ** 2
 
     def forward(self, x):
-        f1 = self.enc1(x)                                # (B, 64,  H,   W)
-        f2 = self.enc2(self.down1(f1))                   # (B, 256, H/2, W/2)
-        f3 = self.enc3(self.down2(f2))                   # (B, D,   H/4, W/4)
-        tokens_2d = self.to_tokens(f3)                   # (B, D,   H/p, W/p)
-        tokens = tokens_2d.flatten(2).transpose(1, 2)    # (B, N, D)
+        f1 = self.enc1(x)
+        f2 = self.enc2(self.down1(f1))
+        f3 = self.enc3(self.down2(f2))
+        tokens_2d = self.to_tokens(f3)
+        tokens = tokens_2d.flatten(2).transpose(1, 2)
         return tokens, [f1, f2, f3]
 
 
-# ============================================================
-# MS-DSE decoding path: symmetric multi-scale decoder
-# ============================================================
-
 class UpBlock(nn.Module):
-    """Bilinear upsample + skip concat + double conv."""
     def __init__(self, in_ch, skip_ch, out_ch):
         super().__init__()
         self.up   = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
@@ -200,54 +256,111 @@ class UpBlock(nn.Module):
         return self.conv(torch.cat([x, skip], dim=1))
 
 
-class TimeModulatedSkip(nn.Module):
-    """
-    Time-Modulated joint skip (TM-Skip).
-
-    At every decoder scale the two skip streams are first concatenated into a
-    joint skip:
-        S_i = [m_i ; n_i]   with m_i the mask-encoder skip (noisy mask state)
-                            and  n_i the image-encoder skip (image detail)
-    which is then modulated per timestep with FiLM driven by e_t:
-        gamma_i, beta_i = MLP_i(e_t)                 # (B, C)
-        F_i             = S_i * (1 + gamma_i) + beta_i
-
-    Without the time modulation the joint skip is a pure conditioning bypass:
-    one mapping fits all t, the network ignores x_t and degenerates into a
-    discriminative model. FiLM scales and shifts the same skip differently at
-    every noise level, so the skip becomes part of the reverse trajectory.
-
-    Init: the last t_mlp layer uses small random weights (std=0.02) and a zero
-    bias, so gamma/beta vary with t from the first step (a zero init brings the
-    shortcut back) while the constant component starts at identity.
-    """
-    def __init__(self, skip_ch, cond_dim, t_proj_dim=64):
+class UBAM(nn.Module):
+    def __init__(self, skip_ch, cond_dim, t_proj_dim=64, gate_hidden=16):
         super().__init__()
-        # e_t -> (gamma, beta), one pair per channel
         self.t_mlp = nn.Sequential(
-            nn.Linear(cond_dim, t_proj_dim),
-            nn.SiLU(),
+            nn.Linear(cond_dim, t_proj_dim), nn.SiLU(),
             nn.Linear(t_proj_dim, 2 * skip_ch),
         )
-        # Small random weights + zero bias; the effective init lives in the
-        # outer initialize_weights, this stays consistent with it.
-        nn.init.normal_(self.t_mlp[-1].weight, std=0.02)
-        nn.init.zeros_(self.t_mlp[-1].bias)
+        self.t_gate_proj = nn.Linear(cond_dim, gate_hidden)
+        self.gate_conv = nn.Sequential(
+            nn.Conv2d(2 + gate_hidden, gate_hidden, 3, padding=1),
+            nn.SiLU(), nn.Conv2d(gate_hidden, 1, 3, padding=1),
+        )
+        self.alpha = nn.Parameter(torch.ones(1))
+        nn.init.zeros_(self.gate_conv[-1].weight)
+        nn.init.zeros_(self.gate_conv[-1].bias)
 
-    def forward(self, skip, e_t):
-        gamma, beta = self.t_mlp(e_t).chunk(2, dim=1)    # each (B, C)
-        return skip * (1.0 + gamma[:, :, None, None]) + beta[:, :, None, None]
+    def forward(self, skip, e_t, uncertainty, boundary):
+        gamma, beta = self.t_mlp(e_t).chunk(2, dim=1)
+        out = skip * (1.0 + gamma[:, :, None, None]) + beta[:, :, None, None]
+        size = skip.shape[-2:]
+        u = F.interpolate(uncertainty, size=size, mode='bilinear', align_corners=False)
+        b = F.interpolate(boundary, size=size, mode='bilinear', align_corners=False)
+        time = self.t_gate_proj(e_t)[:, :, None, None].expand(-1, -1, *size)
+        gate = 1.0 + self.alpha * self.gate_conv(torch.cat([u, b, time], dim=1)).tanh()
+        return out * gate
+
+
+class HierarchicalConditionEncoder(nn.Module):
+    def __init__(self, in_chans, hidden_size, patch_size, input_size,
+                 dino_repo=None, dino_weights=None, dino_pretrained=True):
+        super().__init__()
+        self.cnn = MultiScaleEncoder(in_chans, hidden_size, patch_size, input_size)
+        self.skip_channels = self.cnn.skip_channels
+        self.grid = input_size // patch_size
+        self.dino = torch.hub.load(
+            dino_repo or 'facebookresearch/dinov2:main', 'dinov2_vitb14',
+            source='local' if dino_repo else 'github',
+            pretrained=dino_pretrained and dino_weights is None,
+        )
+        if dino_pretrained and dino_weights:
+            state = torch.load(dino_weights, map_location='cpu', weights_only=True)
+            self.dino.load_state_dict(state, strict=True)
+        self.dino.requires_grad_(False)
+        self.dino.eval()
+        self.cnn_norm = nn.LayerNorm(hidden_size)
+        self.dino_norm = nn.LayerNorm(768)
+        self.to_tokens = nn.Linear(hidden_size + 768, hidden_size)
+        self.register_buffer('image_mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+                             persistent=False)
+        self.register_buffer('image_std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+                             persistent=False)
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.dino.eval()
+        return self
+
+    def forward(self, image):
+        cnn_tokens, skips = self.cnn(image)
+        rgb = (image + 1.0) * 0.5
+        if rgb.shape[1] == 1:
+            rgb = rgb.expand(-1, 3, -1, -1)
+        rgb = (rgb - self.image_mean) / self.image_std
+        with torch.no_grad():
+            rgb = F.interpolate(rgb, size=(self.grid * 14, self.grid * 14),
+                                mode='bicubic', align_corners=False, antialias=True)
+            vit_tokens = self.dino.forward_features(rgb)['x_norm_patchtokens']
+        tokens = self.to_tokens(torch.cat(
+            [self.cnn_norm(cnn_tokens), self.dino_norm(vit_tokens)], dim=-1))
+        return tokens, skips
+
+
+class EnhancedFinalLayer(nn.Module):
+    def __init__(self, hidden_size, patch_size, out_channels):
+        super().__init__()
+        self.refinement = nn.Sequential(
+            RMSNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+        self.norm_final = RMSNorm(hidden_size)
+        intermediate_dim = hidden_size // 2
+        self.mlp_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size, bias=True),
+            nn.GELU(),
+            nn.Linear(hidden_size, intermediate_dim, bias=True),
+            nn.GELU(),
+        )
+        self.output_proj = nn.Linear(intermediate_dim, patch_size * patch_size * out_channels, bias=True)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+        )
+
+    def forward(self, x, c):
+        x = x + self.refinement(x)
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+        x = modulate(self.norm_final(x), shift, scale)
+        return self.output_proj(self.mlp_head(x))
 
 
 class UNetDecoder(nn.Module):
-    """Symmetric U-shaped decoder of MS-DSE.
-
-    The backbone tokens are adaLN-modulated by the timestep, reshaped to a
-    feature map and upsampled stage by stage; at every scale the image-stream
-    and mask-stream skips of the same resolution are concatenated (TM-Skip) and
-    fused by a convolutional block. A 1x1 conv gives the clean-mask estimate.
-    """
-    def __init__(self, hidden_size, out_channels, mask_skip_channels, image_skip_channels):
+    def __init__(self, hidden_size, out_channels, mask_skip_channels, image_skip_channels,
+                 patch_size=16):
         super().__init__()
         D = hidden_size
 
@@ -258,15 +371,14 @@ class UNetDecoder(nn.Module):
         )
 
         self.stage0 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            nn.Upsample(scale_factor=patch_size / 8, mode='bilinear', align_corners=True),
             ConvBlock(D, D // 2),
         )
 
-        # Joint skip channels per scale = mask_skip + image_skip
         sc = [mask_skip_channels[i] + image_skip_channels[i] for i in range(3)]
-        self.tm3 = TimeModulatedSkip(sc[2], cond_dim=D)   # deep, low resolution
-        self.tm2 = TimeModulatedSkip(sc[1], cond_dim=D)
-        self.tm1 = TimeModulatedSkip(sc[0], cond_dim=D)   # shallow, high resolution
+        self.ubam3 = UBAM(mask_skip_channels[2], cond_dim=D)
+        self.ubam2 = UBAM(mask_skip_channels[1], cond_dim=D)
+        self.ubam1 = UBAM(mask_skip_channels[0], cond_dim=D)
 
         self.up1 = UpBlock(D // 2, sc[2], D // 4)
         self.up2 = UpBlock(D // 4, sc[1], D // 8)
@@ -274,7 +386,7 @@ class UNetDecoder(nn.Module):
 
         self.out_conv = nn.Conv2d(64, out_channels, kernel_size=1)
 
-    def forward(self, x, c, mask_skips, image_skips, t_emb):
+    def forward(self, x, c, mask_skips, image_skips, t_emb, uncertainty, boundary):
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
         x = modulate(self.norm(x), shift, scale)
 
@@ -285,52 +397,35 @@ class UNetDecoder(nn.Module):
 
         x = self.stage0(x)
 
-        def _joint(idx):
-            return torch.cat([mask_skips[idx], image_skips[idx]], dim=1)
+        def _joint(idx, ubam):
+            state = ubam(mask_skips[idx], t_emb, uncertainty, boundary)
+            return torch.cat([state, image_skips[idx]], dim=1)
 
-        x = self.up1(x, self.tm3(_joint(2), t_emb))
-        x = self.up2(x, self.tm2(_joint(1), t_emb))
-        x = self.up3(x, self.tm1(_joint(0), t_emb))
+        x = self.up1(x, _joint(2, self.ubam3))
+        x = self.up2(x, _joint(1, self.ubam2))
+        x = self.up3(x, _joint(0, self.ubam1))
 
         return self.out_conv(x)
 
 
 class DFCA(nn.Module):
-    """
-    Diffusion Frequency Cross-Attention (DFCA) with the Parametric
-    Band-Decoupling Filter (PBDF), Sec. III-D of the paper.
-
-    Design:
-      1. PBDF frequency decomposition: a 2D FFT of image_tokens plus two
-         learnable band parameters separate low frequencies
-         (structure/semantics) from a mid-to-high band (detail/boundary).
-      2. Two independent attention streams:
-         - semantic stream: low-frequency K/V, large temperature tau_max
-         - detail stream:   high-frequency K/V, small temperature tau_min
-      3. alpha(t) diffusion-aware fusion of the two stream outputs only
-         (K/V and tau are not coupled to t): high t favours the semantic
-         stream, low t favours the detail stream.
-    """
     def __init__(self, hidden_size: int, num_heads: int, tau_min: float = 0.5, tau_max: float = 1.5,
                  attn_drop: float = 0.0):
         super().__init__()
         assert hidden_size % num_heads == 0
         self.num_heads = num_heads
         self.head_dim  = hidden_size // num_heads
-        self.tau_min   = tau_min   # detail stream, sharp attention
-        self.tau_max   = tau_max   # semantic stream, smooth attention
         self.attn_drop = attn_drop
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm_sem = RMSNorm(self.head_dim)
+        self.k_norm_det = RMSNorm(self.head_dim)
+        self.log_tau_sem = nn.Parameter(torch.full((num_heads,), math.log(tau_max)))
+        self.log_tau_det = nn.Parameter(torch.full((num_heads,), math.log(tau_min)))
 
-        # PBDF bands, initialised to reproduce a fixed sigma = hw/8 Gaussian
-        # low-pass (warm start).
-        #   sigma_s = hw / exp(band_low_log); init ln(8) -> sigma_s = hw/8
         self.band_low_log = nn.Parameter(torch.tensor(math.log(8.0)))
-        # Ordered bandwidth: sigma_n = sigma_s + hw*softplus(band_gap_raw).
-        # The initial normalized gap gives sigma_n = hw/1.5.
         init_gap = 1.0 / 1.5 - 1.0 / 8.0
         self.band_gap_raw = nn.Parameter(torch.tensor(math.log(math.expm1(init_gap))))
 
-        # Q side: AdaLN modulation + Q projection (Q comes from mask tokens)
         self.norm_q  = RMSNorm(hidden_size)
         self.norm_kv = RMSNorm(hidden_size)
         self.adaLN_modulation = nn.Sequential(
@@ -339,43 +434,30 @@ class DFCA(nn.Module):
         )
         self.to_q = nn.Linear(hidden_size, hidden_size, bias=False)
 
-        # Two K/V projections, one per frequency band
         self.to_k_sem = nn.Linear(hidden_size, hidden_size, bias=False)
         self.to_v_sem = nn.Linear(hidden_size, hidden_size, bias=False)
         self.to_k_det = nn.Linear(hidden_size, hidden_size, bias=False)
         self.to_v_det = nn.Linear(hidden_size, hidden_size, bias=False)
 
-        # Detail refinement on the high-frequency features after the inverse
-        # FFT, which adaptively amplifies boundary responses.
         self.detail_enhance = nn.Sequential(
             nn.Conv2d(hidden_size, hidden_size, 3, 1, 1, groups=hidden_size, bias=False),
             nn.GroupNorm(min(32, hidden_size), hidden_size),
             nn.GELU(),
         )
 
-        # alpha(t) fusion weight, warm-started to 0.5 by a zero init
         self.proj_alpha = nn.Linear(hidden_size, 1, bias=True)
 
-        # Output projection, zero-initialised for a warm start
         self.proj = nn.Linear(hidden_size, hidden_size, bias=True)
 
     def _freq_decompose(self, kv_in: torch.Tensor, hw: int):
-        """PBDF decomposition on the centred 2D spectrum:
-            low  (semantics) = low-pass:  m_low  = exp(-r2 / 2 sigma_s^2)
-            high (detail)    = band-pass: m_high = (1-m_low)*exp(-r2 / 2 sigma_n^2)
-        sigma_n suppresses the very top frequencies, keeping the mid-to-high
-        boundary band. Forced to fp32 because FFT is unstable under autocast.
-        """
         B, Ni, D = kv_in.shape
-        feat     = kv_in.reshape(B, hw, hw, D).permute(0, 3, 1, 2).contiguous()  # (B, D, hw, hw)
+        feat     = kv_in.reshape(B, hw, hw, D).permute(0, 3, 1, 2).contiguous()
 
         with torch.amp.autocast(device_type=feat.device.type, enabled=False):
             feat_f   = feat.float()
-            # 2D FFT, then fftshift to centre the spectrum
             feat_fft = torch.fft.fft2(feat_f, dim=(-2, -1), norm='ortho')
             feat_fft = torch.fft.fftshift(feat_fft, dim=(-2, -1))
 
-            # Squared radius from the spectrum centre
             coords = torch.arange(hw, device=feat.device, dtype=torch.float32) - hw // 2
             yy, xx = torch.meshgrid(coords, coords, indexing='ij')
             r2     = xx ** 2 + yy ** 2
@@ -385,19 +467,17 @@ class DFCA(nn.Module):
             m_low   = torch.exp(-r2 / (2 * sigma_s ** 2))
             m_high  = (1.0 - m_low) * torch.exp(-r2 / (2 * sigma_n ** 2))
 
-            m_low    = m_low.unsqueeze(0).unsqueeze(0)   # (1, 1, hw, hw)
+            m_low    = m_low.unsqueeze(0).unsqueeze(0)
             m_high   = m_high.unsqueeze(0).unsqueeze(0)
 
             fft_low  = feat_fft * m_low
             fft_high = feat_fft * m_high
 
-            # Inverse shift + iFFT back to the spatial domain, keep the real part
             kv_low_spatial  = torch.fft.ifft2(torch.fft.ifftshift(fft_low,  dim=(-2, -1)),
                                               dim=(-2, -1), norm='ortho').real
             kv_high_spatial = torch.fft.ifft2(torch.fft.ifftshift(fft_high, dim=(-2, -1)),
                                               dim=(-2, -1), norm='ortho').real
 
-        # Back to the original dtype; refine the high band
         kv_low_spatial  = kv_low_spatial.to(feat.dtype)
         kv_high_spatial = self.detail_enhance(kv_high_spatial.to(feat.dtype))
 
@@ -407,21 +487,20 @@ class DFCA(nn.Module):
 
     def forward(
         self,
-        mask_tokens:  torch.Tensor,   # (B, N,  D)  Q side
-        image_tokens: torch.Tensor,   # (B, Ni, D)  K/V side (static image features)
-        c:            torch.Tensor,   # (B, D)       conditioning vector
-        t_emb:        torch.Tensor,   # (B, D)       timestep embedding for alpha(t)
+        mask_tokens:  torch.Tensor,
+        image_tokens: torch.Tensor,
+        c:            torch.Tensor,
+        t_emb:        torch.Tensor,
+        rope=None,
     ) -> torch.Tensor:
         B, N,  D  = mask_tokens.shape
         _,  Ni, _ = image_tokens.shape
         H,  Hd    = self.num_heads, self.head_dim
 
-        # AdaLN modulation on the Q side
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
         q_in  = modulate(self.norm_q(mask_tokens),  shift, scale)
         kv_in = self.norm_kv(image_tokens)
 
-        # FFT decomposition into a low and a high band
         kv_hw = math.isqrt(Ni)
         assert kv_hw * kv_hw == Ni, (
             f"number of image tokens {Ni} is not a perfect square, a square "
@@ -429,48 +508,43 @@ class DFCA(nn.Module):
         )
         kv_low, kv_high = self._freq_decompose(kv_in, kv_hw)
 
-        # Q / K / V projections
-        q     = self.to_q(q_in).reshape(B, N, H, Hd).transpose(1, 2)              # (B, H, N,  Hd)
-        k_sem = self.to_k_sem(kv_low).reshape(B, Ni, H, Hd).transpose(1, 2)        # (B, H, Ni, Hd)
+        q     = self.to_q(q_in).reshape(B, N, H, Hd).transpose(1, 2)
+        k_sem = self.to_k_sem(kv_low).reshape(B, Ni, H, Hd).transpose(1, 2)
         v_sem = self.to_v_sem(kv_low).reshape(B, Ni, H, Hd).transpose(1, 2)
         k_det = self.to_k_det(kv_high).reshape(B, Ni, H, Hd).transpose(1, 2)
         v_det = self.to_v_det(kv_high).reshape(B, Ni, H, Hd).transpose(1, 2)
+        q = self.q_norm(q)
+        k_sem, k_det = self.k_norm_sem(k_sem), self.k_norm_det(k_det)
+        if rope is not None:
+            q, k_sem, k_det = rope(q), rope(k_sem), rope(k_det)
 
-        alpha = torch.sigmoid(self.proj_alpha(t_emb))          # (B, 1), depends on t
+        alpha = torch.sigmoid(self.proj_alpha(t_emb))
 
-        # Large tau smooths the semantic stream, small tau sharpens the detail one
-        scale_sem = 1.0 / (math.sqrt(Hd) * self.tau_max)
-        scale_det = 1.0 / (math.sqrt(Hd) * self.tau_min)
+        scale_sem = (1.0 / (math.sqrt(Hd) * self.log_tau_sem.float().exp())).view(1, H, 1, 1)
+        scale_det = (1.0 / (math.sqrt(Hd) * self.log_tau_det.float().exp())).view(1, H, 1, 1)
 
-        # Both streams in fp32 to avoid precision loss at the autocast boundary
         with torch.amp.autocast(device_type=mask_tokens.device.type, enabled=False):
             q_f, k_sem_f, v_sem_f = q.float(), k_sem.float(), v_sem.float()
             k_det_f, v_det_f      = k_det.float(), v_det.float()
-            alpha_f               = alpha.float().unsqueeze(1).unsqueeze(-1)  # (B, 1, 1, 1)
+            alpha_f               = alpha.float().unsqueeze(1).unsqueeze(-1)
 
-            # Semantic stream (low band)
-            attn_sem = (q_f @ k_sem_f.transpose(-2, -1)) * scale_sem
-            attn_sem = attn_sem.softmax(dim=-1)
+            attn_sem = ((q_f @ k_sem_f.transpose(-2, -1)) * scale_sem).softmax(dim=-1)
             if self.training and self.attn_drop > 0.0:
                 attn_sem = F.dropout(attn_sem, p=self.attn_drop, training=True)
-            out_sem = attn_sem @ v_sem_f                                   # (B, H, N, Hd)
+            out_sem = attn_sem @ v_sem_f
 
-            # Detail stream (high band)
-            attn_det = (q_f @ k_det_f.transpose(-2, -1)) * scale_det
-            attn_det = attn_det.softmax(dim=-1)
+            attn_det = ((q_f @ k_det_f.transpose(-2, -1)) * scale_det).softmax(dim=-1)
             if self.training and self.attn_drop > 0.0:
                 attn_det = F.dropout(attn_det, p=self.attn_drop, training=True)
             out_det = attn_det @ v_det_f
 
-            # alpha(t) fusion
-            out = alpha_f * out_sem + (1.0 - alpha_f) * out_det            # (B, H, N, Hd)
+            out = alpha_f * out_sem + (1.0 - alpha_f) * out_det
 
-        out = out.to(mask_tokens.dtype).transpose(1, 2).reshape(B, N, D)   # (B, N, D)
+        out = out.to(mask_tokens.dtype).transpose(1, 2).reshape(B, N, D)
         return self.proj(out)
 
 
 class CSGDiTBlock(nn.Module):
-    """Transformer block with adaLN-Zero conditioning."""
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0):
         super().__init__()
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
@@ -492,21 +566,23 @@ class CSGDiTBlock(nn.Module):
 
 
 class CSGDiT_Segmentation(nn.Module):
-
     def __init__(
         self,
-        input_size=256,          # input image size
-        patch_size=16,           # patch size
-        mask_channels=1,         # mask channels (binary = 1, multi-class = K incl. background)
-        image_channels=3,        # image channels (RGB = 3)
+        input_size=256,
+        patch_size=16,
+        mask_channels=1,
+        image_channels=3,
         hidden_size=1024,
         depth=24,
         num_heads=16,
         mlp_ratio=4.0,
-        attn_drop=0.1,           # attention dropout in the middle blocks
-        proj_drop=0.1,           # projection dropout in the middle blocks
-        dfca_attn_drop=0.1,      # attention dropout inside DFCA
-        x0_softmax=None,         # multi-class x0 head (default: on iff mask_channels > 1)
+        attn_drop=0.1,
+        proj_drop=0.1,
+        dfca_attn_drop=0.1,
+        dino_repo=None,
+        dino_weights=None,
+        dino_pretrained=True,
+        x0_softmax=None,
     ):
         super().__init__()
         self.mask_channels = mask_channels
@@ -516,50 +592,52 @@ class CSGDiT_Segmentation(nn.Module):
             raise ValueError('x0_softmax needs mask_channels > 1; a single-channel '
                              'softmax is constant 1, so binary masks use the tanh head')
         self.x0_softmax = x0_softmax
+        if image_channels not in (1, 3):
+            raise ValueError('HCSE supports one-channel or RGB condition images')
+        if input_size % patch_size or patch_size % 4:
+            raise ValueError('input_size must be divisible by patch_size, and patch_size by 4')
+        self.register_buffer('sobel', torch.tensor([
+            [[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]],
+            [[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]],
+        ]).unsqueeze(1))
         self.image_channels = image_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
         self.hidden_size = hidden_size
         self.input_size = input_size
 
-        # === Embeddings ===
         self.t_embedder = TimestepEmbedder(hidden_size)
 
         self.mask_encoder = MultiScaleEncoder(
             in_chans=mask_channels, hidden_size=hidden_size,
             patch_size=patch_size, input_size=input_size
         )
-        self.image_encoder = MultiScaleEncoder(
+        self.image_encoder = HierarchicalConditionEncoder(
             in_chans=image_channels, hidden_size=hidden_size,
-            patch_size=patch_size, input_size=input_size
+            patch_size=patch_size, input_size=input_size,
+            dino_repo=dino_repo, dino_weights=dino_weights, dino_pretrained=dino_pretrained,
         )
 
-        # === Modality embedding ===
         self.modality_embed_image = nn.Parameter(torch.zeros(1, 1, hidden_size), requires_grad=True)
         self.modality_embed_mask  = nn.Parameter(torch.zeros(1, 1, hidden_size), requires_grad=True)
         torch.nn.init.normal_(self.modality_embed_image, std=0.02)
         torch.nn.init.normal_(self.modality_embed_mask,  std=0.02)
 
-        # === Positional encoding ===
         num_patches = self.mask_encoder.num_patches
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
-        # === 2D rotary position encoding ===
         self.feat_rope = VisionRotaryEmbeddingFast(
             dim=hidden_size // num_heads // 2,
             pt_seq_len=input_size // patch_size,
         )
 
-        # === Conditioning MLP ===
-        # The image reaches the mask stream through DFCA only, so c is a
-        # function of the timestep alone.
+        self.pool_weight = nn.Linear(hidden_size, 1)
         self.cond_mlp = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size, bias=True),
+            nn.Linear(2 * hidden_size, hidden_size, bias=True),
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size, bias=True),
         )
 
-        # === Transformer blocks ===
         self.blocks = nn.ModuleList([
             CSGDiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio,
                         attn_drop=attn_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0,
@@ -567,37 +645,38 @@ class CSGDiT_Segmentation(nn.Module):
             for i in range(depth)
         ])
 
-        # === DFCA, one module after every block ===
         self.dfca_layers = nn.ModuleList([
             DFCA(hidden_size, num_heads, attn_drop=dfca_attn_drop)
             for _ in range(depth)
         ])
 
-        # === Output head ===
         self.final_layer = UNetDecoder(
             hidden_size=hidden_size,
             out_channels=mask_channels,
             mask_skip_channels=self.mask_encoder.skip_channels,
             image_skip_channels=self.image_encoder.skip_channels,
+            patch_size=patch_size,
         )
+
+        self.aux_token_head = EnhancedFinalLayer(hidden_size, patch_size, mask_channels)
+        self._aux_out = None
 
         self.initialize_weights()
 
     def initialize_weights(self):
-        """Initialize weights."""
         def _basic_init(module):
             if isinstance(module, nn.Linear):
                 torch.nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
-        self.apply(_basic_init)
+        for name, module in self.named_modules():
+            if not name.startswith('image_encoder.dino'):
+                _basic_init(module)
 
-        # Shared 2D sincos positional encoding, hw inferred from pos_embed
         pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.pos_embed.shape[1] ** 0.5))
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
-        # CNN encoders
-        for encoder in (self.image_encoder, self.mask_encoder):
+        for encoder in (self.image_encoder.cnn, self.mask_encoder):
             for m in encoder.modules():
                 if isinstance(m, nn.Conv2d):
                     nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -607,40 +686,35 @@ class CSGDiT_Segmentation(nn.Module):
                     nn.init.constant_(m.weight, 1)
                     nn.init.constant_(m.bias, 0)
 
-        # Timestep embedder
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
-        # Conditioning MLP
         nn.init.xavier_uniform_(self.cond_mlp[0].weight)
         nn.init.constant_(self.cond_mlp[0].bias, 0)
         nn.init.normal_(self.cond_mlp[2].weight, std=0.02)
         nn.init.constant_(self.cond_mlp[2].bias, 0)
 
-        # Zero-out adaLN modulation, so each block starts as the identity
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
-        # Decoder adaLN
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
 
-        # 1x1 out_conv: small random init instead of the default kaiming_uniform,
-        # which keeps the starting prediction near the linear region of tanh
         nn.init.trunc_normal_(self.final_layer.out_conv.weight, std=0.02)
         nn.init.constant_(self.final_layer.out_conv.bias, 0)
 
-        # TM-Skip: the last t_mlp layer gets small random weights (std=0.02) and
-        # a zero bias, so gamma/beta depend on t from step 0 and the joint skip
-        # cannot degenerate into a time-independent bypass. This must run after
-        # _basic_init (Xavier) above, otherwise Xavier overwrites it.
-        for tm in (self.final_layer.tm1, self.final_layer.tm2, self.final_layer.tm3):
-            nn.init.normal_(tm.t_mlp[-1].weight, std=0.02)
-            nn.init.zeros_(tm.t_mlp[-1].bias)
+        for ubam in (self.final_layer.ubam1, self.final_layer.ubam2, self.final_layer.ubam3):
+            nn.init.normal_(ubam.t_mlp[-1].weight, std=0.02)
+            nn.init.zeros_(ubam.t_mlp[-1].bias)
 
-        # DFCA warm start: zero proj + adaLN, so the output starts near 0, and
-        # zero proj_alpha -> sigmoid(0) = 0.5, an even mix of the two streams
+        nn.init.constant_(self.aux_token_head.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.aux_token_head.adaLN_modulation[-1].bias, 0)
+        nn.init.trunc_normal_(self.aux_token_head.output_proj.weight, std=0.02)
+        nn.init.constant_(self.aux_token_head.output_proj.bias, 0)
+        nn.init.constant_(self.aux_token_head.refinement[-1].weight, 0)
+        nn.init.constant_(self.aux_token_head.refinement[-1].bias, 0)
+
         for dfca in self.dfca_layers:
             nn.init.zeros_(dfca.proj.weight)
             nn.init.zeros_(dfca.proj.bias)
@@ -649,86 +723,81 @@ class CSGDiT_Segmentation(nn.Module):
             nn.init.zeros_(dfca.proj_alpha.weight)
             nn.init.zeros_(dfca.proj_alpha.bias)
 
-    def forward(self, x_mask_noisy, t, image_cond):
-        # === 1. Image tokens and image skips (static, independent of t) ===
+    def encode_condition(self, image_cond):
         image_tokens, image_skips = self.image_encoder(image_cond)
         image_tokens = image_tokens + self.pos_embed + self.modality_embed_image
+        weights = self.pool_weight(image_tokens).softmax(dim=1)
+        context = (weights * image_tokens).sum(dim=1)
+        with torch.amp.autocast(device_type=image_cond.device.type, enabled=False):
+            gray = image_cond.float().mean(dim=1, keepdim=True)
+            grad = F.conv2d(gray, self.sobel.float(), padding=1)
+            magnitude = torch.sqrt(grad.pow(2).sum(dim=1, keepdim=True) + 1e-6)
+            boundary = magnitude / (magnitude.amax(dim=(-2, -1), keepdim=True) + 1e-6)
+        return image_tokens, image_skips, context, boundary
 
-        # === 2. Conditioning vector ===
+    def compute_uncertainty(self, noisy_mask):
+        with torch.amp.autocast(device_type=noisy_mask.device.type, enabled=False):
+            return 1.0 - noisy_mask.float().mean(dim=1, keepdim=True).tanh().abs()
+
+    def forward(self, x_mask_noisy, t, image_cond, condition=None):
+        if condition is None:
+            condition = self.encode_condition(image_cond)
+        image_tokens, image_skips, context, boundary = condition
+
         t_emb = self.t_embedder(t)
-        c = self.cond_mlp(t_emb)
+        c = self.cond_mlp(torch.cat([t_emb, context], dim=-1))
 
-        # === 3. Mask tokens and mask skips (depend on x_t) ===
         mask_tokens, mask_skips = self.mask_encoder(x_mask_noisy)
         mask_tokens = mask_tokens + self.pos_embed + self.modality_embed_mask
 
-        # === 4. Backbone: self-attention over mask tokens, DFCA injection ===
         for block, dfca in zip(self.blocks, self.dfca_layers):
             mask_tokens = block(mask_tokens, c, self.feat_rope)
-            mask_tokens = mask_tokens + dfca(mask_tokens, image_tokens, c, t_emb)
+            mask_tokens = mask_tokens + dfca(mask_tokens, image_tokens, c, t_emb,
+                                             rope=self.feat_rope)
 
-        # === 5. Output head ===
-        return self._x0_act(
-            self.final_layer(mask_tokens, c, mask_skips, image_skips, t_emb))
+        if self.training:
+            self._aux_out = self._x0_act(self.unpatchify(self.aux_token_head(mask_tokens, c)))
+
+        uncertainty = self.compute_uncertainty(x_mask_noisy)
+        return self._x0_act(self.final_layer(
+            mask_tokens, c, mask_skips, image_skips, t_emb, uncertainty, boundary))
+
+    def unpatchify(self, x):
+        p, C = self.patch_size, self.mask_channels
+        h = math.isqrt(x.shape[1])
+        x = x.reshape(x.shape[0], h, h, p, p, C)
+        x = torch.einsum('nhwpqc->nchpwq', x)
+        return x.reshape(x.shape[0], C, h * p, h * p)
 
     def _x0_act(self, z):
-        """Map the decoder output into the [-1, 1] mask range.
-
-        Binary (K = 1): tanh, one independent channel.
-        Multi-class (K > 1): x0 = 2 * softmax(z) - 1. The range is the same, but
-        a signed one-hot target satisfies sum_c x0[c] = 2 - K at every pixel,
-        which the softmax head matches by construction; raising one channel
-        lowers the others, so a rare organ is not dragged to -1 by its own
-        negatives and stuck in the saturated region of a per-channel tanh.
-        """
         if self.x0_softmax:
             return 2.0 * z.softmax(dim=1) - 1.0
         return torch.tanh(z)
 
 
-# ============================================
-# Model variants
-# ============================================
-
 def CSGDiT_S_16(**kwargs):
-    """Small variant, patch_size=16 (4 blocks)."""
     return CSGDiT_Segmentation(depth=4, hidden_size=512, num_heads=8, patch_size=16, **kwargs)
 
 def CSGDiT_S_32(**kwargs):
-    """Small variant, patch_size=32."""
     return CSGDiT_Segmentation(depth=4, hidden_size=512, num_heads=8, patch_size=32, **kwargs)
 
 def CSGDiT_B_16(**kwargs):
-    """Base variant, patch_size=16 (6 blocks, tuned for small datasets)."""
     return CSGDiT_Segmentation(depth=6, hidden_size=768, num_heads=12, patch_size=16, **kwargs)
 
 def CSGDiT_B_32(**kwargs):
-    """Base variant, patch_size=32 (6 blocks, tuned for small datasets)."""
     return CSGDiT_Segmentation(depth=6, hidden_size=768, num_heads=12, patch_size=32, **kwargs)
 
 def CSGDiT_L_16(**kwargs):
-    """Large variant, patch_size=16 (8 blocks)."""
     return CSGDiT_Segmentation(depth=8, hidden_size=1024, num_heads=16, patch_size=16, **kwargs)
 
 def CSGDiT_L_32(**kwargs):
-    """Large variant, patch_size=32 (8 blocks)."""
     return CSGDiT_Segmentation(depth=8, hidden_size=1024, num_heads=16, patch_size=32, **kwargs)
 
 def CSGDiT_H_16(**kwargs):
-    """Huge variant, patch_size=16 (12 blocks)."""
     return CSGDiT_Segmentation(depth=12, hidden_size=1280, num_heads=16, patch_size=16, **kwargs)
 
 def CSGDiT_H_32(**kwargs):
-    """Huge variant, patch_size=32 (12 blocks)."""
     return CSGDiT_Segmentation(depth=12, hidden_size=1280, num_heads=16, patch_size=32, **kwargs)
-
-
-# Model registry
-def normalize_model_name(name):
-    """Accept legacy checkpoint labels while using CSGDiT names internally."""
-    if name.startswith('FASDiT-'):
-        return 'CSGDiT-' + name[len('FASDiT-'):]
-    return name
 
 
 CSGDiT_models = {

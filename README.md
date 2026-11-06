@@ -19,6 +19,30 @@ pip install -r requirements.txt
 
 Run the following commands from the repository root.
 
+The image condition stream uses a frozen, pretrained DINOv2 ViT-B/14. The first
+training run loads the official implementation and weights through PyTorch Hub.
+For offline use, pass a checkout of the
+[official DINOv2 repository](https://github.com/facebookresearch/dinov2) and its
+weights:
+
+```bash
+python train.py --dataset glas     --dino_repo /path/to/dinov2     --dino_weights /path/to/dinov2_vitb14_pretrain.pth
+```
+
+## Repository structure
+
+```text
+CSG-DiT/
+├── train.py            # training entry point (per-dataset defaults in _DATASET_DEFAULTS)
+├── inference.py        # sampling and evaluation entry point
+└── csg_dit/
+    ├── model.py        # CSG-DiT network (HCSE, DiT blocks, DFCA/PBDF, UBAM, decoder)
+    ├── diffusion.py    # noise schedule, DDIM sampling and training loss
+    ├── data.py         # dataset loaders and the Synapse split generator
+    ├── metrics.py      # IoU/DSC/HD95/GED/ECE, slice-level metrics, Params/GFLOPs
+    └── utils.py        # EMA, early stopping, checkpoints, LR schedule, logger
+```
+
 ## Data preparation
 
 Datasets and trained checkpoints are not included. Obtain the data separately
@@ -26,13 +50,13 @@ and prepare the directories below.
 
 ### Binary segmentation
 
-| Dataset | Directory | Source |
-| --- | --- | --- |
-| GlaS | `processed_glas/` | [GlaS Challenge](https://warwick.ac.uk/fac/cross_fac/tia/data/glascontest/) |
-| MoNuSeg | `processed_monuseg/` | [MoNuSeg Challenge](https://monuseg.grand-challenge.org/Data/) |
-| PH2 | `processed_ph2/` | [PH2 Database](https://www.fc.up.pt/addi/ph2%20database.html) |
-| IMID | `processed_imid/` | Private dataset |
-| TNBC | `processed_tnbc/` | [TNBC Dataset](https://zenodo.org/records/1174343) |
+| Dataset | Directory              | Source                                                                     |
+| ------- | ---------------------- | -------------------------------------------------------------------------- |
+| GlaS    | `processed_glas/`    | [GlaS Challenge](https://warwick.ac.uk/fac/cross_fac/tia/data/glascontest/) |
+| MoNuSeg | `processed_monuseg/` | [MoNuSeg Challenge](https://monuseg.grand-challenge.org/Data/)              |
+| PH2     | `processed_ph2/`     | [PH2 Database](<https://www.fc.up.pt/addi/ph2%20database.html>)             |
+| IMID    | `processed_imid/`    | Private dataset                                                            |
+| TNBC    | `processed_tnbc/`    | [TNBC Dataset](https://zenodo.org/records/1174343)                          |
 
 Each directory uses this structure:
 
@@ -72,11 +96,11 @@ Synapse/
 Generate the case-level split file:
 
 ```bash
-python prepare_synapse_split.py
+python -m csg_dit.data
 ```
 
 This writes `Synapse/split.json` without a validation set. To reserve validation
-cases, use `python prepare_synapse_split.py --val_cases 4` instead.
+cases, use `python -m csg_dit.data --val_cases 4` instead.
 
 ## Training
 
@@ -84,18 +108,23 @@ cases, use `python prepare_synapse_split.py --val_cases 4` instead.
 python train.py --dataset glas
 ```
 
-Training supports `glas`, `ph2`, `imid`, `monuseg` and `synapse`. Dataset defaults
-are defined in `_DATASET_DEFAULTS` in `train.py`.
+This trains the complete CSG-DiT model with the settings of the paper.
+Training supports `glas`, `ph2`, `imid`, `monuseg` and `synapse`; per-dataset
+settings are in `_DATASET_DEFAULTS` and shared settings in `_COMMON` in
+`train.py`. The command line only exposes common options: `--batch_size`,
+`--epochs`, `--lr`, `--gpu`, `--num_workers`, `--seed`, `--resume`,
+`--save_dir`, `--log_dir`, `--dino_repo` and `--dino_weights`.
 
 Checkpoints are saved to `checkpoints/<dataset>_<model>_<timestamp>/` and logs to
-`logs/`. For binary datasets, evaluate `best_model.pth`. Under the default
+`logs/`. A checkpoint stores the full model state, including the frozen DINOv2
+weights. For binary datasets, evaluate `best_model.pth`. Under the default
 Synapse split, training has no early stopping or validation-based model
 selection; evaluate `final_model.pth`.
 
-To resume training:
+To resume training from the latest checkpoint:
 
 ```bash
-python train.py --dataset glas --resume checkpoints/<run>/checkpoint_epoch100.pth
+python train.py --dataset glas --resume checkpoints/<run>/last_model.pth
 ```
 
 ## Inference
@@ -103,20 +132,22 @@ python train.py --dataset glas --resume checkpoints/<run>/checkpoint_epoch100.pt
 ```bash
 python inference.py \
     --checkpoint checkpoints/<run>/best_model.pth \
-    --dataset glas --use_ema --K 25 --save_images
+    --dataset glas --save_images
 ```
 
-Metrics are saved to `results/<dataset>/metrics.txt`. Use `--save_images` to save
-predictions and comparison images. `--K` controls the number of averaged sampling
-trajectories (25 for the paper setting; 1 for faster inference), and
-`--ddim_steps` controls the sampling steps (default: 20).
+Inference follows the paper protocol: EMA weights, deterministic DDIM with
+`--ddim_steps 20` and `--K 25` averaged trajectories (use `--K 1` for faster
+inference). The model and diffusion settings are read from the checkpoint.
+Metrics are saved to `results/<dataset>/metrics.txt`; `--save_images` also
+saves predictions and comparison images. For offline inference add
+`--dino_repo /path/to/dinov2`.
 
 For Synapse volume-level evaluation:
 
 ```bash
 python inference.py \
     --checkpoint checkpoints/<synapse-run>/final_model.pth \
-    --dataset synapse --use_ema --K 25
+    --dataset synapse
 ```
 
 For MoNuSeg-to-TNBC evaluation without fine-tuning:
@@ -124,11 +155,5 @@ For MoNuSeg-to-TNBC evaluation without fine-tuning:
 ```bash
 python inference.py \
     --checkpoint checkpoints/<monuseg-run>/best_model.pth \
-    --dataset tnbc --use_ema --K 25
+    --dataset tnbc
 ```
-
-See `python train.py --help` and `python inference.py --help` for all options.
-
-## License
-
-[MIT License](LICENSE).

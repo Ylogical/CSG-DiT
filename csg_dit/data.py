@@ -1,34 +1,7 @@
-"""
-Dataset loaders for CSGDiT.
-
-Binary datasets (GlaS / MoNuSeg / PH2 / IMID / TNBC) follow the layout below,
-relative to the project root (see README.md):
-
-  processed_glas/ | processed_monuseg/ | processed_ph2/ | processed_imid/
-    train/images/*.png   train/masks/*.png
-    val/images/*.png     val/masks/*.png
-    test/images/*.png    test/masks/*.png
-
-An image and its mask are matched by file name stem, so their extensions may
-differ.
-
-Synapse is multi-class (background + 8 organs = 9 classes) and keeps the
-TransUNet layout instead:
-
-  Synapse/
-    train_npz/caseXXXX_sliceYYY.npz   2D slices, image + label, 512x512
-    test_vol_h5/caseXXXX.npy.h5       3D volumes of the 12 test cases
-    split.json                        written by prepare_synapse_split.py
-
-Ranges after loading:
-    image     -> (3, H, W) float in [-1, 1]
-    mask      -> (1, H, W) float in {-1, +1}                        binary
-              -> (K, H, W) float in {-1, +1}, signed one-hot        multi-class
-    label_idx -> (H, W) int64, the multi-class integer label (for the CE term)
-"""
 import os
 import json
 import random
+import argparse
 
 import numpy as np
 from PIL import Image
@@ -39,23 +12,19 @@ import torchvision.transforms.functional as TF
 
 try:
     import h5py
-except ImportError:                     # only needed for the Synapse test split
+except ImportError:
     h5py = None
 
 
-# Dataset root directories (relative to the project root)
 _DATASET_ROOT = {
     'glas':    'processed_glas',
     'monuseg': 'processed_monuseg',
     'ph2':     'processed_ph2',
     'imid':    'processed_imid',
-    # Evaluation only: target domain of the MoNuSeg -> TNBC transfer experiment
     'tnbc':    'processed_tnbc',
-    # Multi-class abdominal CT (TransUNet layout, not processed_*)
     'synapse': 'Synapse',
 }
 
-# Mask channels per dataset: 1 for binary, K (incl. background) for multi-class
 _DATASET_NUM_CLASSES = {
     'glas': 1, 'monuseg': 1, 'ph2': 1, 'imid': 1, 'tnbc': 1,
     'synapse': 9,
@@ -79,15 +48,7 @@ def get_dataset_root(dataset_name: str) -> str:
 
 
 class MedicalSegmentationDataset(Dataset):
-    """Binary medical image segmentation dataset (image + mask pairs)."""
-
     def __init__(self, root_dir: str, split: str = 'train', image_size: int = 256):
-        """
-        Args:
-            root_dir  : dataset root, e.g. 'processed_glas'
-            split     : 'train' | 'val' | 'test'
-            image_size: images and masks are resized to image_size x image_size
-        """
         self.root_dir   = root_dir
         self.split      = split
         self.image_size = image_size
@@ -100,7 +61,7 @@ class MedicalSegmentationDataset(Dataset):
             raise FileNotFoundError(
                 f"Dataset directory not found: {self.image_dir}\n"
                 f"Expected {root_dir}/{{train,val,test}}/{{images,masks}}/ "
-                f"- see the 'Data' section of README.md"
+                f"- see 'Data preparation' in README.md"
             )
 
         self.filenames = sorted([
@@ -110,7 +71,6 @@ class MedicalSegmentationDataset(Dataset):
         if len(self.filenames) == 0:
             raise RuntimeError(f"Empty dataset: {self.image_dir}")
 
-        # Match each image to its mask by file name stem
         _exts = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')
         mask_by_stem = {
             os.path.splitext(m)[0]: m
@@ -141,24 +101,19 @@ class MedicalSegmentationDataset(Dataset):
         return len(self.filenames)
 
     def apply_augmentation(self, image: Image.Image, mask: Image.Image):
-        """Synchronized augmentation for image and mask (train split only)."""
-        # 1. Random 90-degree rotation
         if random.random() > 0.5:
             angle = random.choice([90, 180, 270])
             image = TF.rotate(image, angle)
             mask  = TF.rotate(mask,  angle)
 
-        # 2. Random horizontal flip
         if random.random() > 0.5:
             image = TF.hflip(image)
             mask  = TF.hflip(mask)
 
-        # 3. Random vertical flip
         if random.random() > 0.5:
             image = TF.vflip(image)
             mask  = TF.vflip(mask)
 
-        # 4. Random scale + crop (0.8-1.2x)
         if random.random() > 0.3:
             scale    = random.uniform(0.8, 1.2)
             new_size = int(self.image_size * scale)
@@ -175,11 +130,9 @@ class MedicalSegmentationDataset(Dataset):
                 mask  = TF.resize(mask,  self.image_size,
                                   interpolation=transforms.InterpolationMode.NEAREST)
 
-        # 5. Color jitter (image only)
         if random.random() > 0.3:
             image = self.color_jitter(image)
 
-        # 6. Random Gaussian blur (image only)
         if random.random() > 0.7:
             image = TF.gaussian_blur(image, random.choice([3, 5]))
 
@@ -199,58 +152,29 @@ class MedicalSegmentationDataset(Dataset):
         if self.is_train:
             image, mask = self.apply_augmentation(image, mask)
 
-        image = self.to_tensor(image)          # (3, H, W) in [0, 1]
-        mask  = self.to_tensor(mask)           # (1, H, W) in [0, 1]
+        image = self.to_tensor(image)
+        mask  = self.to_tensor(mask)
 
         return {
-            'image':    image * 2.0 - 1.0,                    # [-1, +1]
-            'mask':     (mask > 0.5).float() * 2.0 - 1.0,     # {-1, +1}
+            'image':    image * 2.0 - 1.0,
+            'mask':     (mask > 0.5).float() * 2.0 - 1.0,
             'filename': fname,
         }
 
 
 class SynapseDataset(Dataset):
-    """Synapse multi-organ CT segmentation (background + 8 organs = 9 classes).
-
-    train / val: 2D slices from Synapse/train_npz/, filtered by the case lists
-                 in split.json, so slices of one case never straddle the splits.
-    test       : the 12 volumes in Synapse/test_vol_h5/, unrolled into 2D slices
-                 named "caseXXXX_sliceYYY". Each test sample also carries
-                 'label_full', the label at its native 512x512 resolution, so the
-                 evaluation can restore the prediction and score case-wise 3D
-                 volumes at that resolution (the protocol used by TransUNet and
-                 by the diffusion baselines).
-
-    Augmentation matches MedicalSegmentationDataset.apply_augmentation step by
-    step (same operations, same probabilities); it runs on tensors instead of
-    PIL images because the labels are integer class maps.
-    """
-
     NUM_CLASSES = 9
     CLASS_NAMES = ['background', 'aorta', 'gallbladder', 'kidney_left',
                    'kidney_right', 'liver', 'pancreas', 'spleen', 'stomach']
-    # Organ short names used in the reports
     ORGAN_NAMES = {1: 'Aorta', 2: 'GB', 3: 'KL', 4: 'KR',
                    5: 'Liver', 6: 'PC', 7: 'SP', 8: 'SM'}
 
-    # CT window (TransUNet): clip to [-125, 275] HU, then min-max to [0, 1]
     CT_CLIP_MIN = -125.0
     CT_CLIP_MAX = 275.0
 
     def __init__(self, root_dir: str, split: str = 'train', image_size: int = 224,
                  split_json: str = None, native_label: bool = None,
                  allow_empty: bool = False):
-        """
-        Args:
-            root_dir    : Synapse root (train_npz / test_vol_h5 / split.json)
-            split       : 'train' | 'val' | 'test'
-            image_size  : network input resolution (224 in the paper)
-            split_json  : defaults to <root_dir>/split.json
-            native_label: also return the native-resolution label; None turns it
-                          on for the test split only
-            allow_empty : tolerate an empty split (val is empty when the split
-                          was built with --val_cases 0)
-        """
         if split == 'test' and h5py is None:
             raise ImportError('The Synapse test split needs h5py (pip install h5py)')
 
@@ -265,8 +189,8 @@ class SynapseDataset(Dataset):
         if not os.path.isfile(split_json):
             raise FileNotFoundError(
                 f"Synapse split.json not found: {split_json}\n"
-                f"Run `python prepare_synapse_split.py` first - see the 'Data' "
-                f"section of README.md"
+                f"Run `python -m csg_dit.data` first - see 'Data preparation' "
+                f"in README.md"
             )
         with open(split_json, 'r', encoding='utf-8') as f:
             split_info = json.load(f)
@@ -275,7 +199,6 @@ class SynapseDataset(Dataset):
 
         self.cases = set(split_info[split].get('cases', []))
 
-        # (file path, case id, slice index or None, sample name)
         if split in ('train', 'val'):
             npz_dir = os.path.join(root_dir, 'train_npz')
             if not os.path.isdir(npz_dir):
@@ -320,7 +243,6 @@ class SynapseDataset(Dataset):
         return (img - cls.CT_CLIP_MIN) / (cls.CT_CLIP_MAX - cls.CT_CLIP_MIN)
 
     def _load_sample(self, fpath, slice_idx):
-        """Returns (image (H, W) float in [0, 1], label (H, W) int64), native size."""
         if slice_idx is None:
             data  = np.load(fpath)
             image = data['image'].astype(np.float32)
@@ -329,14 +251,12 @@ class SynapseDataset(Dataset):
             with h5py.File(fpath, 'r') as f:
                 image = f['image'][slice_idx].astype(np.float32)
                 label = f['label'][slice_idx].astype(np.int64)
-        # The released npz/h5 files are already windowed to [0, 1]; raw HU is not
         if image.max() > 1.5 or image.min() < -0.5:
             image = self._normalize_ct(image)
         return image, label
 
     @staticmethod
     def _resize_pair(image_t, label_t, size):
-        """Bilinear for the image, nearest for the label."""
         if image_t.shape[-2:] == (size, size):
             return image_t, label_t
         image_t = TF.resize(image_t, [size, size],
@@ -348,29 +268,21 @@ class SynapseDataset(Dataset):
         return image_t, label_t
 
     def _geometric_augmentation(self, image_t, label_t):
-        """Steps 1-4 of MedicalSegmentationDataset.apply_augmentation.
-
-        image_t: (1, H, W) float in [0, 1]   label_t: (H, W) int64
-        """
         H = self.image_size
 
-        # 1. Random 90-degree rotation
         if random.random() > 0.5:
             k = {90: 1, 180: 2, 270: 3}[random.choice([90, 180, 270])]
             image_t = torch.rot90(image_t, k, dims=[1, 2])
             label_t = torch.rot90(label_t, k, dims=[0, 1])
 
-        # 2. Random horizontal flip
         if random.random() > 0.5:
             image_t = torch.flip(image_t, dims=[2])
             label_t = torch.flip(label_t, dims=[1])
 
-        # 3. Random vertical flip
         if random.random() > 0.5:
             image_t = torch.flip(image_t, dims=[1])
             label_t = torch.flip(label_t, dims=[0])
 
-        # 4. Random scale + crop (0.8-1.2x)
         if random.random() > 0.3:
             scale    = random.uniform(0.8, 1.2)
             new_size = int(H * scale)
@@ -385,11 +297,6 @@ class SynapseDataset(Dataset):
         return image_t.contiguous(), label_t.contiguous()
 
     def _photometric_augmentation(self, image_3ch):
-        """Steps 5-6, applied after the channel copy and before the [-1, 1] map.
-
-        CT is grayscale, so the three channels are equal and saturation / hue are
-        identity here; brightness and contrast are what actually act.
-        """
         if random.random() > 0.3:
             image_3ch = self.color_jitter(image_3ch)
         if random.random() > 0.7:
@@ -400,7 +307,6 @@ class SynapseDataset(Dataset):
         fpath, case_id, slice_idx, fname = self.samples[idx]
         image, label = self._load_sample(fpath, slice_idx)
 
-        # Native-resolution label, kept before any resizing
         label_native = (torch.from_numpy(label.copy()).long()
                         if self.native_label else None)
 
@@ -410,19 +316,18 @@ class SynapseDataset(Dataset):
         if self.is_train:
             image_t, label_t = self._geometric_augmentation(image_t, label_t)
 
-        # Single CT channel -> 3 channels, so the image encoder is unchanged
         image_3ch = image_t.repeat(3, 1, 1).clamp(0.0, 1.0)
         if self.is_train:
             image_3ch = self._photometric_augmentation(image_3ch)
 
         label_t = label_t.clamp(0, self.NUM_CLASSES - 1)
         onehot  = torch.nn.functional.one_hot(label_t, self.NUM_CLASSES)
-        onehot  = onehot.permute(2, 0, 1).float()       # (K, H, W) in {0, 1}
+        onehot  = onehot.permute(2, 0, 1).float()
 
         out = {
-            'image':     image_3ch * 2.0 - 1.0,         # (3, H, W) in [-1, +1]
-            'mask':      onehot * 2.0 - 1.0,            # (K, H, W) in {-1, +1}
-            'label_idx': label_t,                       # (H, W) int64
+            'image':     image_3ch * 2.0 - 1.0,
+            'mask':      onehot * 2.0 - 1.0,
+            'label_idx': label_t,
             'filename':  fname,
             'case_id':   case_id,
         }
@@ -432,7 +337,6 @@ class SynapseDataset(Dataset):
 
 
 def synapse_has_val(root_dir: str = None, split_json: str = None) -> bool:
-    """Whether split.json defines a non-empty Synapse validation split."""
     if split_json is None:
         split_json = os.path.join(root_dir or _DATASET_ROOT['synapse'], 'split.json')
     try:
@@ -443,7 +347,6 @@ def synapse_has_val(root_dir: str = None, split_json: str = None) -> bool:
 
 
 def _make_dataset(dataset_name: str, split: str, image_size: int):
-    """Build one split of dataset_name, binary or multi-class."""
     root = get_dataset_root(dataset_name)
     if is_multiclass(dataset_name):
         return SynapseDataset(root, split, image_size,
@@ -464,7 +367,6 @@ def _make_loader(dataset, batch_size, shuffle, num_workers, drop_last=False):
 
 def get_dataloader(dataset_name: str, batch_size: int = 8, image_size: int = 256,
                    num_workers: int = 4):
-    """Train and test DataLoaders. Returns (train_loader, test_loader)."""
     return (
         _make_loader(_make_dataset(dataset_name, 'train', image_size),
                      batch_size, True, num_workers, drop_last=True),
@@ -475,12 +377,6 @@ def get_dataloader(dataset_name: str, batch_size: int = 8, image_size: int = 256
 
 def get_dataloader_with_val(dataset_name: str, batch_size: int = 8,
                             image_size: int = 256, num_workers: int = 4):
-    """Train / val / test DataLoaders (the splits are fixed on disk).
-
-    Returns (train_loader, val_loader, test_loader). val_loader is None when the
-    split defines no validation set, which is the case for Synapse under the
-    TransUNet protocol (18 training cases, 12 test cases, no val).
-    """
     val_ds = _make_dataset(dataset_name, 'val', image_size)
     return (
         _make_loader(_make_dataset(dataset_name, 'train', image_size),
@@ -490,3 +386,84 @@ def get_dataloader_with_val(dataset_name: str, batch_size: int = 8,
         _make_loader(_make_dataset(dataset_name, 'test', image_size),
                      batch_size, False, num_workers),
     )
+
+
+SYNAPSE_CLASS_NAMES = ['background', 'aorta', 'gallbladder', 'kidney_left',
+                       'kidney_right', 'liver', 'pancreas', 'spleen', 'stomach']
+
+
+def _parse_split_args():
+    p = argparse.ArgumentParser(description='Generate the Synapse train/val/test split.')
+    p.add_argument('--root', type=str, default=_DATASET_ROOT['synapse'],
+                   help='Synapse root directory (holds train_npz / test_vol_h5)')
+    p.add_argument('--val_cases', type=int, default=0,
+                   help='How many of the 18 training cases to hold out for '
+                        'validation (0 = the protocol used in the paper)')
+    p.add_argument('--seed', type=int, default=42,
+                   help='Seed of the case shuffle, so the split is reproducible')
+    p.add_argument('--output', type=str, default=None,
+                   help='Output path (default: <root>/split.json)')
+    return p.parse_args()
+
+
+def prepare_synapse_split():
+    args = _parse_split_args()
+
+    train_npz_dir = os.path.join(args.root, 'train_npz')
+    test_h5_dir   = os.path.join(args.root, 'test_vol_h5')
+    for d in (train_npz_dir, test_h5_dir):
+        if not os.path.isdir(d):
+            raise FileNotFoundError(f"Directory not found: {d}")
+
+    npz_files = [f for f in os.listdir(train_npz_dir) if f.endswith('.npz')]
+    all_train_cases = sorted({f.split('_')[0] for f in npz_files})
+
+    test_files = sorted(f for f in os.listdir(test_h5_dir) if f.endswith('.h5'))
+    test_cases = [f.split('.')[0] for f in test_files]
+
+    if args.val_cases >= len(all_train_cases):
+        raise ValueError(f"--val_cases {args.val_cases} must be smaller than the "
+                         f"{len(all_train_cases)} available training cases")
+
+    shuffled = list(all_train_cases)
+    random.Random(args.seed).shuffle(shuffled)
+    val_cases   = sorted(shuffled[:args.val_cases])
+    train_cases = sorted(shuffled[args.val_cases:])
+
+    n_train_slices = sum(1 for f in npz_files if f.split('_')[0] in train_cases)
+    n_val_slices   = sum(1 for f in npz_files if f.split('_')[0] in val_cases)
+
+    split = {
+        'description': 'Synapse multi-organ segmentation '
+                       '(9 classes: background + aorta, gallbladder, left kidney, '
+                       'right kidney, liver, pancreas, spleen, stomach)',
+        'num_classes': len(SYNAPSE_CLASS_NAMES),
+        'class_names': SYNAPSE_CLASS_NAMES,
+        'seed': args.seed,
+        'val_cases_n': args.val_cases,
+        'train': {'cases': train_cases, 'n_cases': len(train_cases),
+                  'n_slices': n_train_slices, 'source': 'train_npz'},
+        'val':   {'cases': val_cases, 'n_cases': len(val_cases),
+                  'n_slices': n_val_slices, 'source': 'train_npz'},
+        'test':  {'cases': test_cases, 'files': test_files,
+                  'n_cases': len(test_cases), 'source': 'test_vol_h5 (3D volumes)'},
+    }
+
+    out_path = args.output or os.path.join(args.root, 'split.json')
+    with open(out_path, 'w', encoding='utf-8') as f:
+        json.dump(split, f, indent=2)
+
+    print(f"Train cases ({len(train_cases)}): {train_cases}")
+    print(f"Val   cases ({len(val_cases)}): {val_cases}")
+    print(f"Test  cases ({len(test_cases)}): {test_cases}")
+    print(f"Train slices (2D npz): {n_train_slices}")
+    print(f"Val   slices (2D npz): {n_val_slices}")
+    print(f"Test  volumes (3D h5): {len(test_cases)}")
+    if not val_cases:
+        print("No validation split: training runs for the full --epochs and "
+              "final_model.pth is the model to evaluate.")
+    print(f"\nSplit written to {out_path}")
+
+
+if __name__ == '__main__':
+    prepare_synapse_split()

@@ -1,5 +1,5 @@
-torch>=2.1
-torchvision>=0.16
+torch>=2.5
+torchvision>=0.20
 numpy>=1.22
 scipy>=1.9
 matplotlib>=3.5

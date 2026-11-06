@@ -1,26 +1,133 @@
-"""
-Training logger for CSGDiT: mirrors stdout to a log file, records train/eval losses and
-IoU/Dice, and plots the curves. Resumes from an existing loss_history.json.
-"""
 import os
 import sys
-import time
-from datetime import datetime
-import matplotlib
-matplotlib.use('Agg')  # must be set before importing pyplot
-import matplotlib.pyplot as plt
 import json
+import time
+import random
+from datetime import datetime
+
+import numpy as np
+import torch
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+
+def set_seed(seed):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def get_lr_scheduler(optimizer, warmup_epochs, total_epochs):
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        denom = max(1, total_epochs - warmup_epochs)
+        progress = (epoch - warmup_epochs) / denom
+        return 0.05 + 0.95 * 0.5 * (1.0 + np.cos(np.pi * progress))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+class EMA:
+    def __init__(self, model, decay=0.9999):
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    def update(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                self.shadow[name] = ((1.0 - self.decay) * param.data
+                                     + self.decay * self.shadow[name]).clone()
+
+    def apply_shadow(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data
+                param.data = self.shadow[name]
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                param.data = self.backup[name]
+        self.backup = {}
+
+
+class EarlyStopping:
+    def __init__(self, patience: int, min_delta: float = 1e-4, min_epochs: int = 0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.min_epochs = min_epochs
+        self.counter = 0
+        self.best_score = None
+        self.best_epoch = -1
+
+    def __call__(self, score: float, epoch: int) -> bool:
+        if self.best_score is None or score > self.best_score + self.min_delta:
+            self.best_score = score
+            self.best_epoch = epoch
+            self.counter = 0
+            return False
+        if epoch < self.min_epochs:
+            return False
+        self.counter += 1
+        return self.counter >= self.patience
+
+    def status_str(self) -> str:
+        return (f'[EarlyStop] counter={self.counter}/{self.patience}  '
+                f'best_mIoU={self.best_score:.4f} @ epoch {self.best_epoch}')
+
+
+def save_checkpoint(model, optimizer, scheduler, epoch, loss, save_path,
+                    ema=None, args=None):
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'loss': loss,
+    }
+    if args is not None:
+        checkpoint['train_config'] = {
+            'model': args.model,
+            'dataset': args.dataset,
+            'image_size': args.image_size,
+            'image_channels': args.image_channels,
+            'mask_channels': args.mask_channels,
+            'num_timesteps': args.num_timesteps,
+            'beta_schedule': args.beta_schedule,
+            'attn_drop': args.attn_drop,
+            'proj_drop': args.proj_drop,
+            'weight_decay': args.weight_decay,
+        }
+    if ema is not None:
+        checkpoint['ema_shadow'] = ema.shadow
+    torch.save(checkpoint, save_path)
+    print(f"Checkpoint saved to {save_path}")
+
+
+def load_checkpoint(model, optimizer, scheduler, checkpoint_path, ema=None):
+    checkpoint = torch.load(checkpoint_path, weights_only=False)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    if ema is not None and 'ema_shadow' in checkpoint:
+        ema.shadow = checkpoint['ema_shadow']
+    print(f"Checkpoint loaded from {checkpoint_path}, epoch {checkpoint['epoch']}, "
+          f"loss {checkpoint['loss']:.4f}")
+    return checkpoint['epoch']
 
 
 class TrainingLogger:
-    """Training logger."""
-
     def __init__(self, log_dir='logs', exp_name=None):
-        """
-        Args:
-            log_dir: directory the logs are written to
-            exp_name: experiment name (auto-generated from the time if None)
-        """
         if exp_name is None:
             exp_name = datetime.now().strftime('%Y%m%d_%H%M%S')
 
@@ -54,7 +161,6 @@ class TrainingLogger:
         self.log(f"{'='*60}\n")
 
     def write(self, message):
-        """stdout hook: write to both the terminal and the log file."""
         self.terminal.write(message)
         self.log_fp.write(message)
         self.log_fp.flush()
@@ -69,15 +175,6 @@ class TrainingLogger:
         self.write(log_message)
 
     def log_epoch(self, epoch, train_loss, eval_loss=None, lr=None, iou=None, dice=None):
-        """
-        Args:
-            epoch: current epoch
-            train_loss: mean training loss
-            eval_loss: validation loss (optional)
-            lr: current learning rate (optional)
-            iou: mean IoU (optional, only computed every few epochs)
-            dice: mean Dice (optional, only computed every few epochs)
-        """
         self.epochs.append(epoch)
         self.train_losses.append(train_loss)
         if eval_loss is not None:
@@ -130,7 +227,6 @@ class TrainingLogger:
                 self.iou_list = history.get('iou_list', [])
                 self.dice_list = history.get('dice_list', [])
                 self.metric_epochs = history.get('metric_epochs', [])
-                # Older histories have no eval_epochs field
                 if not self.eval_epochs and self.eval_losses:
                     self.eval_epochs = [self.epochs[i] for i in range(len(self.eval_losses))]
                 self.log(f"Loaded loss history: {len(self.epochs)} epochs")
@@ -138,7 +234,6 @@ class TrainingLogger:
                 pass
 
     def plot_loss_curve(self):
-        """Plot the loss curves, plus IoU/Dice when metrics were recorded."""
         if len(self.epochs) == 0:
             return
 

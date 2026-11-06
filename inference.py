@@ -1,26 +1,3 @@
-"""
-CSGDiT inference and evaluation.
-
-Every test image is sampled K times with deterministic DDIM and the K soft
-predictions are averaged into an MMSE estimate.
-
-Binary datasets: the estimate is thresholded per image, and the report gives
-mIoU, DSC, Sensitivity (Recall), Accuracy, Precision, HD95, GED and ECE.
-
-Synapse (multi-class): the estimate is taken per class by argmax, restored to
-the native 512x512 label resolution with nearest-neighbour upsampling, and the
-slices of a case are stacked back into a 3D volume. The report gives the
-case-wise 3D DSC and HD95 per organ, each averaged over cases first and then
-over the eight organs, next to the slice-level scores.
-
-Both paths also report the parameter count and GFLOPs.
-
-Examples:
-  python inference.py --checkpoint checkpoints/<run>/best_model.pth \\
-      --dataset glas --use_ema --K 25 --save_images
-  python inference.py --checkpoint checkpoints/<run>/final_model.pth \\
-      --dataset synapse --use_ema --K 25
-"""
 import os
 import time
 import argparse
@@ -30,156 +7,15 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 
-from model_csg_dit import CSGDiT_models, normalize_model_name
-from dataset import get_dataloader, get_num_classes, SynapseDataset
-from diffusion_utils import DiffusionSchedule
-
-try:
-    from scipy.ndimage import distance_transform_edt, binary_erosion, generate_binary_structure
-    _SCIPY_OK = True
-except ImportError:
-    _SCIPY_OK = False
-
-
-# ----------------------------------------------
-# Metrics
-# ----------------------------------------------
-def compute_metrics(pred_binary, gt_binary):
-    """IoU / Dice / Precision / Recall / Accuracy for one (H, W) pair."""
-    pred = pred_binary.astype(bool)
-    gt   = gt_binary.astype(bool)
-
-    tp = (pred & gt).sum()
-    fp = (pred & ~gt).sum()
-    fn = (~pred & gt).sum()
-    tn = (~pred & ~gt).sum()
-
-    iou       = tp / (tp + fp + fn + 1e-8)
-    dice      = 2 * tp / (2 * tp + fp + fn + 1e-8)
-    precision = tp / (tp + fp + 1e-8)
-    recall    = tp / (tp + fn + 1e-8)
-    acc       = (tp + tn) / (tp + fp + fn + tn + 1e-8)
-    return iou, dice, precision, recall, acc
-
-
-def _surface_distances(pred, gt):
-    """Distance from every point of the pred surface to the gt surface."""
-    conn = generate_binary_structure(pred.ndim, 1)
-    pred_border = pred ^ binary_erosion(pred, structure=conn, iterations=1)
-    gt_border   = gt   ^ binary_erosion(gt,   structure=conn, iterations=1)
-    return distance_transform_edt(~gt_border)[pred_border]
-
-
-def compute_hd95(pred, gt):
-    """Symmetric 95th percentile Hausdorff distance in pixels (lower is better).
-
-    Returns None without scipy. A degenerate case (pred or GT empty) counts as
-    0, the convention used in the segmentation literature.
-    """
-    if not _SCIPY_OK:
-        return None
-    pred = np.asarray(pred).astype(bool)
-    gt   = np.asarray(gt).astype(bool)
-    if not pred.any() or not gt.any():
-        return 0.0
-
-    # Crop to the joint bounding box (1 pixel margin): same result, faster
-    idx = np.nonzero(pred | gt)
-    slicer = tuple(slice(max(int(i.min()) - 1, 0), min(int(i.max()) + 2, s))
-                   for i, s in zip(idx, pred.shape))
-    pred, gt = pred[slicer], gt[slicer]
-
-    sds = np.hstack((_surface_distances(pred, gt), _surface_distances(gt, pred)))
-    return float(np.percentile(sds, 95))
-
-
-def _dice_dist(a, b):
-    """Dice distance d = 1 - Dice(a, b), used inside the GED."""
-    a, b = a.astype(bool), b.astype(bool)
-    return 1.0 - 2.0 * (a & b).sum() / (a.sum() + b.sum() + 1e-8)
-
-
-def compute_ged(k_preds, gt):
-    """Generalized Energy Distance over K samples (lower is better).
-
-        GED^2 = 2*E[d(S,G)] - E[d(S,S')] - E[d(G,G')]
-
-    With a single GT annotation E[d(G,G')] = 0.
-    """
-    K = len(k_preds)
-    sg = 2.0 * sum(_dice_dist(s, gt) for s in k_preds) / K
-    ss = sum(_dice_dist(k_preds[i], k_preds[j])
-             for i in range(K) for j in range(K)) / (K * K)
-    return float(sg - ss)
-
-
-def compute_ece(prob_flat, gt_flat, n_bins=15):
-    """Expected Calibration Error over equal-width probability bins."""
-    prob_flat = np.clip(prob_flat, 0.0, 1.0)
-    bins = np.linspace(0.0, 1.0, n_bins + 1)
-    ece, N = 0.0, len(prob_flat)
-    for lo, hi in zip(bins[:-1], bins[1:]):
-        mask = (prob_flat >= lo) & (prob_flat < hi)
-        if mask.sum() == 0:
-            continue
-        ece += mask.sum() / N * abs(prob_flat[mask].mean() - gt_flat[mask].mean())
-    return float(ece)
-
-
-# ----------------------------------------------
-# Model cost
-# ----------------------------------------------
-def count_params(model):
-    """Total parameters, in millions."""
-    return sum(p.numel() for p in model.parameters()) / 1e6
-
-
-def estimate_gflops(model, image_size, mask_channels, image_channels, device):
-    """GFLOPs of one denoising step, from MACs counted with forward hooks
-    (Conv2d / ConvTranspose2d / Linear); GFLOPs = 2 * MACs / 1e9."""
-    import torch.nn as nn
-
-    macs = [0]
-    hooks = []
-
-    def _hook_conv2d(m, inp, out):
-        B, Co, Ho, Wo = out.shape
-        kH, kW = m.kernel_size if isinstance(m.kernel_size, tuple) else (m.kernel_size,) * 2
-        macs[0] += B * Co * Ho * Wo * (m.in_channels // m.groups) * kH * kW
-
-    def _hook_deconv2d(m, inp, out):
-        B, Ci, Hi, Wi = inp[0].shape
-        kH, kW = m.kernel_size if isinstance(m.kernel_size, tuple) else (m.kernel_size,) * 2
-        macs[0] += B * Ci * Hi * Wi * (m.out_channels // m.groups) * kH * kW
-
-    def _hook_linear(m, inp, out):
-        macs[0] += (inp[0].numel() // m.in_features) * m.in_features * m.out_features
-
-    for mod in model.modules():
-        if isinstance(mod, nn.Conv2d):
-            hooks.append(mod.register_forward_hook(_hook_conv2d))
-        elif isinstance(mod, nn.ConvTranspose2d):
-            hooks.append(mod.register_forward_hook(_hook_deconv2d))
-        elif isinstance(mod, nn.Linear):
-            hooks.append(mod.register_forward_hook(_hook_linear))
-
-    model.eval()
-    try:
-        with torch.no_grad():
-            model(torch.zeros(1, mask_channels, image_size, image_size, device=device),
-                  torch.zeros(1, dtype=torch.long, device=device),
-                  torch.zeros(1, image_channels, image_size, image_size, device=device))
-        gflops = 2.0 * macs[0] / 1e9
-    except Exception:
-        gflops = None
-    finally:
-        for h in hooks:
-            h.remove()
-    return gflops
+from csg_dit.model import CSGDiT_models
+from csg_dit.data import get_dataloader, get_num_classes, SynapseDataset
+from csg_dit.diffusion import DiffusionSchedule
+from csg_dit.utils import set_seed
+from csg_dit.metrics import (SCIPY_AVAILABLE, compute_metrics, compute_hd95,
+                             compute_ged, compute_ece, count_params, estimate_gflops)
 
 
 def make_comparison(img_np, gt_np, pred_np):
-    """Comparison strip [image | GT overlay | prediction overlay]."""
     def overlay(img, mask, color, alpha=0.4):
         out = img.copy().astype(np.float32)
         for c, v in enumerate(color):
@@ -192,9 +28,6 @@ def make_comparison(img_np, gt_np, pred_np):
                            overlay(img_np, pred_np, (255, 80, 0))], axis=1)
 
 
-# ----------------------------------------------
-# Inference
-# ----------------------------------------------
 @torch.no_grad()
 def run_inference(model, diffusion, test_loader, device, args):
     model.eval()
@@ -212,19 +45,17 @@ def run_inference(model, diffusion, test_loader, device, args):
     hd95_overhead = 0.0
 
     for batch in tqdm(test_loader, desc='Running inference'):
-        images = batch['image'].to(device)      # (B, 3, H, W) in [-1, 1]
-        masks  = batch['mask'].to(device)       # (B, 1, H, W) in {-1, +1}
+        images = batch['image'].to(device)
+        masks  = batch['mask'].to(device)
         B, _, H, W = images.shape
 
-        # K independent DDIM trajectories
         k_soft = [diffusion.ddim_sample(model, (B, 1, H, W), images, device,
                                         ddim_steps=args.ddim_steps, eta=args.eta,
                                         progress=False).float()
                   for _ in range(args.K)]
 
-        # MMSE estimate
-        pred_mask = torch.stack(k_soft, dim=0).mean(dim=0)               # (B, 1, H, W)
-        prob_map  = (pred_mask.cpu().numpy()[:, 0] + 1.0) / 2.0          # [0, 1] for the ECE
+        pred_mask = torch.stack(k_soft, dim=0).mean(dim=0)
+        prob_map  = (pred_mask.cpu().numpy()[:, 0] + 1.0) / 2.0
         pred_np   = (pred_mask.cpu().numpy()[:, 0] > args.threshold).astype(np.uint8)
         gt_np     = (masks.cpu().numpy()[:, 0] > args.threshold).astype(np.uint8)
         k_binary  = [(ks.cpu().numpy()[:, 0] > args.threshold).astype(np.uint8)
@@ -237,14 +68,13 @@ def run_inference(model, diffusion, test_loader, device, args):
             ious.append(iou); dices.append(dice)
             precs.append(prec); recs.append(rec); accs.append(acc)
 
-            if not args.skip_hd95 and _SCIPY_OK:
+            if not args.skip_hd95 and SCIPY_AVAILABLE:
                 _t = time.perf_counter()
                 h = compute_hd95(pred_b, gt_b)
                 if h is not None:
                     all_hd95.append(h)
                 hd95_overhead += time.perf_counter() - _t
 
-            # The GED needs several samples
             if args.K > 1:
                 all_ged.append(compute_ged([kb[i] for kb in k_binary], gt_b))
 
@@ -282,11 +112,6 @@ def run_inference(model, diffusion, test_loader, device, args):
     }
 
 
-
-# ----------------------------------------------
-# Multi-class evaluation (Synapse)
-# ----------------------------------------------
-# Palette for the 9 Synapse classes (index 0 = background)
 _PALETTE = np.array([
     [0, 0, 0], [220, 20, 60], [0, 200, 0], [30, 144, 255], [255, 215, 0],
     [148, 0, 211], [255, 140, 0], [0, 255, 255], [255, 105, 180],
@@ -294,7 +119,6 @@ _PALETTE = np.array([
 
 
 def _slice_index(filename, fallback):
-    """Slice number out of a "caseXXXX_sliceYYY" sample name."""
     if '_slice' in filename:
         try:
             return int(filename.split('_slice')[-1])
@@ -305,28 +129,13 @@ def _slice_index(filename, fallback):
 
 @torch.no_grad()
 def run_inference_multiclass(model, diffusion, test_loader, device, args):
-    """Case-wise 3D evaluation of the Synapse multi-organ predictions.
-
-    Per slice: average K DDIM samples, argmax over the class channels, then
-    restore the prediction to the native label resolution (512x512) with
-    nearest-neighbour upsampling, which is the protocol the compared methods
-    use. Slices are cached per case, stacked into a volume in slice order, and
-    scored per organ; each organ is averaged over cases first and the eight
-    organ scores are then averaged (the TransUNet aggregation order).
-
-    A (case, organ) pair with an empty prediction and an empty GT scores DSC 1;
-    HD95 is undefined whenever either side is empty and counts as 0 there, and
-    the number of such pairs is reported alongside.
-    """
     from collections import defaultdict
 
     model.eval()
     num_classes = args.mask_channels
     organ_names = SynapseDataset.ORGAN_NAMES
 
-    # Slice-level (native resolution) macro scores, for reference
     slice_iou, slice_dice, slice_sen, slice_acc = [], [], [], []
-    # case id -> [(slice index, prediction (H, W), GT (H, W))]
     case_slices = defaultdict(list)
 
     if args.save_images:
@@ -337,13 +146,12 @@ def run_inference_multiclass(model, diffusion, test_loader, device, args):
     t_start = time.perf_counter()
 
     for batch in tqdm(test_loader, desc='Running inference (multi-class)'):
-        images    = batch['image'].to(device)          # (B, 3, H, W)
-        gt_masks  = batch['mask'].to(device)           # (B, K, H, W) in {-1, +1}
+        images    = batch['image'].to(device)
+        gt_masks  = batch['mask'].to(device)
         case_ids  = batch.get('case_id',  [''] * images.shape[0])
         filenames = batch.get('filename', [''] * images.shape[0])
         B, _, H, W = images.shape
 
-        # K independent DDIM trajectories, averaged into the MMSE estimate
         pred_avg = None
         for _ in range(args.K):
             pred_k = diffusion.ddim_sample(model, (B, num_classes, H, W), images,
@@ -352,7 +160,6 @@ def run_inference_multiclass(model, diffusion, test_loader, device, args):
             pred_avg = pred_k if pred_avg is None else pred_avg + pred_k
         pred_avg = pred_avg / args.K
 
-        # Restore to the native label resolution when the loader provides it
         label_full = batch.get('label_full')
         if label_full is not None:
             H0, W0 = label_full.shape[-2], label_full.shape[-1]
@@ -372,7 +179,7 @@ def run_inference_multiclass(model, diffusion, test_loader, device, args):
                 pc, gc = (p == c), (g == c)
                 inter, p_sum, g_sum = float((pc & gc).sum()), float(pc.sum()), float(gc.sum())
                 if p_sum == 0 and g_sum == 0:
-                    continue        # organ absent from this slice
+                    continue
                 cls_iou.append(inter / (p_sum + g_sum - inter + 1e-6))
                 cls_dice.append(2 * inter / (p_sum + g_sum + 1e-6))
                 cls_sen.append(inter / (g_sum + 1e-6))
@@ -400,20 +207,18 @@ def run_inference_multiclass(model, diffusion, test_loader, device, args):
 
     total_time = time.perf_counter() - t_start
 
-    # ---- Case-wise 3D scores ----
-    do_hd95 = (not args.skip_hd95) and _SCIPY_OK
-    dsc_per_organ  = defaultdict(list)          # class -> one DSC per case
+    do_hd95 = (not args.skip_hd95) and SCIPY_AVAILABLE
+    dsc_per_organ  = defaultdict(list)
     hd95_per_organ = defaultdict(list)
     n_degenerate = 0
 
     for cid in tqdm(sorted(case_slices), desc='Case-wise 3D metrics'):
         items    = sorted(case_slices[cid], key=lambda it: it[0])
-        pred_vol = np.stack([it[1] for it in items], axis=0)     # (D, H, W)
+        pred_vol = np.stack([it[1] for it in items], axis=0)
         gt_vol   = np.stack([it[2] for it in items], axis=0)
         for c in range(1, num_classes):
             pc, gc = (pred_vol == c), (gt_vol == c)
             inter, p_sum, g_sum = float((pc & gc).sum()), float(pc.sum()), float(gc.sum())
-            # Both sides empty: the organ is correctly absent, DSC = 1
             dsc_per_organ[c].append(1.0 if p_sum + g_sum == 0
                                     else 2 * inter / (p_sum + g_sum + 1e-6))
             if do_hd95:
@@ -443,98 +248,82 @@ def run_inference_multiclass(model, diffusion, test_loader, device, args):
     }
 
 
-# ----------------------------------------------
-# CLI
-# ----------------------------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description='CSGDiT inference')
-    p.add_argument('--checkpoint',     type=str, required=True)
-    p.add_argument('--dataset',        type=str, default='glas',
+    p = argparse.ArgumentParser(description='CSG-DiT inference')
+    p.add_argument('--checkpoint',  type=str, required=True)
+    p.add_argument('--dataset',     type=str, default='glas',
                    choices=['glas', 'monuseg', 'ph2', 'imid', 'tnbc', 'synapse'])
-    p.add_argument('--model',          type=normalize_model_name, default=None,
-                   choices=list(CSGDiT_models.keys()),
-                   help='Model variant (default: read from the checkpoint, else B/16)')
-    p.add_argument('--image_size',     type=int, default=None,
-                   help='Input size (default: glas/ph2/imid=256, monuseg/tnbc=512, '
-                        'synapse=224)')
-    p.add_argument('--batch_size',     type=int, default=4)
-    p.add_argument('--image_channels', type=int, default=3)
-    p.add_argument('--mask_channels',  type=int, default=None,
-                   help='Mask channels (default: read from the checkpoint, '
-                        'else 1 and synapse=9)')
-    p.add_argument('--num_timesteps',  type=int, default=200)
-    p.add_argument('--beta_schedule',  type=str, default='cosine',
-                   choices=['linear', 'cosine'])
-    p.add_argument('--ddim_steps',     type=int, default=20,
-                   help="Number of DDIM reverse steps T'")
-    p.add_argument('--eta',            type=float, default=0.0,
-                   help='DDIM stochasticity: 0 = deterministic')
-    p.add_argument('--K',              type=int, default=1,
-                   help='Number of DDIM samples averaged into the MMSE estimate '
-                        '(K=25 is the setting used in the paper)')
-    p.add_argument('--threshold',      type=float, default=0.0,
-                   help='Binarization threshold for masks in [-1, 1]')
-    p.add_argument('--use_ema',        action='store_true', default=False,
-                   help='Evaluate the EMA weights stored in the checkpoint')
-    p.add_argument('--skip_hd95',      action='store_true', default=False)
-    p.add_argument('--save_images',    action='store_true', default=False)
-    p.add_argument('--output_dir',     type=str, default='results')
-    p.add_argument('--num_workers',    type=int, default=4)
-    p.add_argument('--device',         type=str, default='cuda')
-    p.add_argument('--gpu',            type=int, default=0)
-    return p.parse_args()
+    p.add_argument('--K',           type=int, default=25,
+                   help='Number of DDIM samples averaged per image (paper: 25; 1 = fast)')
+    p.add_argument('--ddim_steps',  type=int, default=20,
+                   help="Number of DDIM reverse steps T' (paper: 20)")
+    p.add_argument('--batch_size',  type=int, default=4)
+    p.add_argument('--save_images', action='store_true', default=False,
+                   help='Save predictions and comparison images')
+    p.add_argument('--skip_hd95',   action='store_true', default=False,
+                   help='Skip HD95 (faster)')
+    p.add_argument('--output_dir',  type=str, default='results')
+    p.add_argument('--gpu',         type=int, default=0)
+    p.add_argument('--num_workers', type=int, default=4)
+    p.add_argument('--dino_repo',   type=str, default=None,
+                   help='Local checkout of the official DINOv2 repository (offline use); '
+                        'the DINOv2 weights themselves are restored from the checkpoint')
+    args = p.parse_args()
+    args.eta = 0.0
+    args.threshold = 0.0
+    args.use_ema = True
+    return args
 
 
 def main():
     args = parse_args()
+    set_seed(1234)
 
-    if args.device == 'cuda' and torch.cuda.is_available():
+    if torch.cuda.is_available():
         torch.cuda.set_device(args.gpu)
         device = torch.device(f'cuda:{args.gpu}')
     else:
         device = torch.device('cpu')
 
-    # Read the training config recorded in the checkpoint
     print(f"Loading checkpoint from {args.checkpoint}...")
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     cfg = ckpt.get('train_config', {})
-    if 'model' in cfg:
-        cfg = dict(cfg, model=normalize_model_name(cfg['model']))
     if cfg:
         print("\n[Checkpoint train config]")
         for k, v in cfg.items():
             print(f"  {k}: {v}")
         print()
 
-    if args.model is None:
-        args.model = cfg.get('model', 'CSGDiT-B/16')
-    elif 'model' in cfg and cfg['model'] != args.model:
-        raise RuntimeError(f"--model {args.model} but the checkpoint was trained with "
-                           f"{cfg['model']}; the architectures do not match.")
-    if args.image_size is None:
-        args.image_size = cfg.get('image_size') or (
-            224 if args.dataset == 'synapse'
-            else 512 if args.dataset in ('monuseg', 'tnbc') else 256)
-    if args.mask_channels is None:
-        args.mask_channels = cfg.get('mask_channels') or get_num_classes(args.dataset)
+    if cfg.get('model', '').startswith(('FAS', 'JiT')):
+        raise RuntimeError('This checkpoint predates CSG-DiT (no HCSE / UBAM); '
+                           'use a CSG-DiT checkpoint.')
+    args.model          = cfg.get('model', 'CSGDiT-B/16')
+    args.num_timesteps  = cfg.get('num_timesteps', 200)
+    args.beta_schedule  = cfg.get('beta_schedule', 'cosine')
+    args.image_channels = cfg.get('image_channels', 3)
+    args.image_size     = cfg.get('image_size') or (
+        224 if args.dataset == 'synapse'
+        else 512 if args.dataset in ('monuseg', 'tnbc') else 256)
+    args.mask_channels  = cfg.get('mask_channels') or get_num_classes(args.dataset)
     multiclass = args.mask_channels > 1
 
-    # Data
     print("Loading dataset...")
     _, test_loader = get_dataloader(args.dataset, batch_size=args.batch_size,
                                     image_size=args.image_size,
                                     num_workers=args.num_workers)
     print(f"Test samples: {len(test_loader.dataset)}")
 
-    # Model
     print(f"Creating model {args.model} @ {args.image_size}x{args.image_size}...")
     model = CSGDiT_models[args.model](
         input_size=args.image_size,
         mask_channels=args.mask_channels,
         image_channels=args.image_channels,
+        dino_repo=args.dino_repo,
+        dino_pretrained=False,
     ).to(device)
 
-    if args.use_ema and 'ema_shadow' in ckpt:
+    model.load_state_dict(ckpt['model_state_dict'], strict=True)
+    if 'ema_shadow' in ckpt:
         print("Loading EMA weights...")
         ema_shadow = ckpt['ema_shadow']
         model_keys = {n for n, p in model.named_parameters() if p.requires_grad}
@@ -544,9 +333,7 @@ def main():
             if name in ema_shadow:
                 param.data.copy_(ema_shadow[name])
     else:
-        if args.use_ema:
-            print("[WARNING] no ema_shadow in the checkpoint, using the raw weights")
-        model.load_state_dict(ckpt['model_state_dict'])
+        print("[WARNING] no ema_shadow in the checkpoint, using the raw weights")
 
     diffusion = DiffusionSchedule(num_timesteps=args.num_timesteps,
                                   schedule_type=args.beta_schedule)
@@ -561,12 +348,11 @@ def main():
     else:
         r = run_inference(model, diffusion, test_loader, device, args)
 
-    # ---- Report ----
     header = [
         f"Checkpoint: {args.checkpoint}",
         f"Dataset:    {args.dataset} ({r['n_images']} images @ {args.image_size})",
         f"Sampling:   DDIM T'={args.ddim_steps}, eta={args.eta}, K={args.K}"
-        f"{' (EMA)' if args.use_ema else ''}",
+        f"{' (EMA)' if 'ema_shadow' in ckpt else ''}",
         "",
         f"Params:    {params:.2f} M",
         f"GFLOPs:    {gflops:.2f}" if gflops is not None else "GFLOPs:    N/A",
