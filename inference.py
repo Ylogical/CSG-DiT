@@ -326,10 +326,16 @@ def main():
         dino_pretrained=False,
     ).to(device)
 
-    model.load_state_dict(ckpt['model_state_dict'], strict=True)
+    # Checkpoints from earlier code versions may hold an auxiliary token head
+    # that is not part of CSG-DiT; it never affects inference, so drop it.
+    legacy = 'aux_token_head.'
+    state_dict = {k: v for k, v in ckpt['model_state_dict'].items()
+                  if not k.startswith(legacy)}
+    model.load_state_dict(state_dict, strict=True)
     if 'ema_shadow' in ckpt:
         print("Loading EMA weights...")
-        ema_shadow = ckpt['ema_shadow']
+        ema_shadow = {k: v for k, v in ckpt['ema_shadow'].items()
+                      if not k.startswith(legacy)}
         model_keys = {n for n, p in model.named_parameters() if p.requires_grad}
         if model_keys != set(ema_shadow.keys()):
             raise RuntimeError("The EMA weights do not match the model structure.")

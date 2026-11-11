@@ -328,36 +328,6 @@ class HierarchicalConditionEncoder(nn.Module):
         return tokens, skips
 
 
-class EnhancedFinalLayer(nn.Module):
-    def __init__(self, hidden_size, patch_size, out_channels):
-        super().__init__()
-        self.refinement = nn.Sequential(
-            RMSNorm(hidden_size),
-            nn.Linear(hidden_size, hidden_size),
-            nn.GELU(),
-            nn.Linear(hidden_size, hidden_size),
-        )
-        self.norm_final = RMSNorm(hidden_size)
-        intermediate_dim = hidden_size // 2
-        self.mlp_head = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size, bias=True),
-            nn.GELU(),
-            nn.Linear(hidden_size, intermediate_dim, bias=True),
-            nn.GELU(),
-        )
-        self.output_proj = nn.Linear(intermediate_dim, patch_size * patch_size * out_channels, bias=True)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
-        )
-
-    def forward(self, x, c):
-        x = x + self.refinement(x)
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
-        x = modulate(self.norm_final(x), shift, scale)
-        return self.output_proj(self.mlp_head(x))
-
-
 class UNetDecoder(nn.Module):
     def __init__(self, hidden_size, out_channels, mask_skip_channels, image_skip_channels,
                  patch_size=16):
@@ -675,9 +645,6 @@ class CSGDiT_Segmentation(nn.Module):
             patch_size=patch_size,
         )
 
-        self.aux_token_head = EnhancedFinalLayer(hidden_size, patch_size, mask_channels)
-        self._aux_out = None
-
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -725,13 +692,6 @@ class CSGDiT_Segmentation(nn.Module):
             nn.init.normal_(ubam.t_mlp[-1].weight, std=0.02)
             nn.init.zeros_(ubam.t_mlp[-1].bias)
 
-        nn.init.constant_(self.aux_token_head.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.aux_token_head.adaLN_modulation[-1].bias, 0)
-        nn.init.trunc_normal_(self.aux_token_head.output_proj.weight, std=0.02)
-        nn.init.constant_(self.aux_token_head.output_proj.bias, 0)
-        nn.init.constant_(self.aux_token_head.refinement[-1].weight, 0)
-        nn.init.constant_(self.aux_token_head.refinement[-1].bias, 0)
-
         for dfca in self.dfca_layers:
             nn.init.zeros_(dfca.proj.weight)
             nn.init.zeros_(dfca.proj.bias)
@@ -754,7 +714,7 @@ class CSGDiT_Segmentation(nn.Module):
 
     def compute_uncertainty(self, noisy_mask):
         with torch.amp.autocast(device_type=noisy_mask.device.type, enabled=False):
-            return 1.0 - noisy_mask.float().mean(dim=1, keepdim=True).tanh().abs()
+            return 1.0 - noisy_mask.float().tanh().abs().mean(dim=1, keepdim=True)
 
     def forward(self, x_mask_noisy, t, image_cond, condition=None):
         if condition is None:
@@ -772,19 +732,9 @@ class CSGDiT_Segmentation(nn.Module):
             mask_tokens = mask_tokens + dfca(mask_tokens, image_tokens, c, t_emb,
                                              rope=self.feat_rope)
 
-        if self.training:
-            self._aux_out = self._x0_act(self.unpatchify(self.aux_token_head(mask_tokens, c)))
-
         uncertainty = self.compute_uncertainty(x_mask_noisy)
         return self._x0_act(self.final_layer(
             mask_tokens, c, mask_skips, image_skips, t_emb, uncertainty, boundary))
-
-    def unpatchify(self, x):
-        p, C = self.patch_size, self.mask_channels
-        h = math.isqrt(x.shape[1])
-        x = x.reshape(x.shape[0], h, h, p, p, C)
-        x = torch.einsum('nhwpqc->nchpwq', x)
-        return x.reshape(x.shape[0], C, h * p, h * p)
 
     def _x0_act(self, z):
         if self.x0_softmax:

@@ -54,7 +54,6 @@ _COMMON = {
     'grad_clip': 1.0,
     'ema_decay': 0.9999,
     'es_delta': 1e-4,
-    'aux_token_loss': 0.3,
     'val_seed': 1234,
 }
 
@@ -149,7 +148,6 @@ def train_one_epoch(model, diffusion, train_loader, optimizer, device, epoch,
             model, diffusion, batch, device,
             dice_weight=args.dice_weight,
             ce_weight=args.ce_weight,
-            aux_weight=args.aux_token_loss,
         )
         optimizer.zero_grad()
         loss.backward()

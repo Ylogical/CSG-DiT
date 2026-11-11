@@ -103,7 +103,7 @@ def dice_loss(pred, target, smooth=1e-5):
 
 
 def compute_loss(model, diffusion, batch, device, use_dice=True, dice_weight=1.0,
-                 ce_weight=0.0, aux_weight=0.0):
+                 ce_weight=0.0):
     image = batch['image'].to(device)
     mask  = batch['mask'].to(device)
 
@@ -128,16 +128,5 @@ def compute_loss(model, diffusion, batch, device, use_dice=True, dice_weight=1.0
             label = (mask.argmax(dim=1) if label is None else label.to(device)).long()
             loss = loss + ce_weight * F.nll_loss(torch.log(pred_01.clamp_min(1e-7)),
                                                  label)
-
-    if aux_weight > 0.0:
-        net = getattr(model, 'module', model)
-        aux = getattr(net, '_aux_out', None)
-        if aux is not None:
-            aux_loss = F.mse_loss(aux, mask)
-            if use_dice:
-                aux_loss = aux_loss + dice_weight * dice_loss((aux + 1.0) / 2.0,
-                                                              (mask > 0.0).float())
-            loss = loss + aux_weight * aux_loss
-            net._aux_out = None
 
     return loss, pred_x0, mask
