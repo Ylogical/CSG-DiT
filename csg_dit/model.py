@@ -410,15 +410,21 @@ class UNetDecoder(nn.Module):
 
 class DFCA(nn.Module):
     def __init__(self, hidden_size: int, num_heads: int, tau_min: float = 0.5, tau_max: float = 1.5,
-                 attn_drop: float = 0.0):
+                 attn_drop: float = 0.0, kv_mode: str = 'split'):
         super().__init__()
         assert hidden_size % num_heads == 0
+        if kv_mode not in ('split', 'v_only'):
+            raise ValueError(f"kv_mode must be 'split' or 'v_only', got {kv_mode!r}")
         self.num_heads = num_heads
         self.head_dim  = hidden_size // num_heads
         self.attn_drop = attn_drop
+        self.kv_mode   = kv_mode
         self.q_norm = RMSNorm(self.head_dim)
-        self.k_norm_sem = RMSNorm(self.head_dim)
-        self.k_norm_det = RMSNorm(self.head_dim)
+        if kv_mode == 'v_only':
+            self.k_norm = RMSNorm(self.head_dim)
+        else:
+            self.k_norm_sem = RMSNorm(self.head_dim)
+            self.k_norm_det = RMSNorm(self.head_dim)
         self.log_tau_sem = nn.Parameter(torch.full((num_heads,), math.log(tau_max)))
         self.log_tau_det = nn.Parameter(torch.full((num_heads,), math.log(tau_min)))
 
@@ -434,10 +440,15 @@ class DFCA(nn.Module):
         )
         self.to_q = nn.Linear(hidden_size, hidden_size, bias=False)
 
-        self.to_k_sem = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.to_v_sem = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.to_k_det = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.to_v_det = nn.Linear(hidden_size, hidden_size, bias=False)
+        if kv_mode == 'v_only':
+            self.to_k     = nn.Linear(hidden_size, hidden_size, bias=False)
+            self.to_v_sem = nn.Linear(hidden_size, hidden_size, bias=False)
+            self.to_v_det = nn.Linear(hidden_size, hidden_size, bias=False)
+        else:
+            self.to_k_sem = nn.Linear(hidden_size, hidden_size, bias=False)
+            self.to_v_sem = nn.Linear(hidden_size, hidden_size, bias=False)
+            self.to_k_det = nn.Linear(hidden_size, hidden_size, bias=False)
+            self.to_v_det = nn.Linear(hidden_size, hidden_size, bias=False)
 
         self.detail_enhance = nn.Sequential(
             nn.Conv2d(hidden_size, hidden_size, 3, 1, 1, groups=hidden_size, bias=False),
@@ -509,14 +520,19 @@ class DFCA(nn.Module):
         kv_low, kv_high = self._freq_decompose(kv_in, kv_hw)
 
         q     = self.to_q(q_in).reshape(B, N, H, Hd).transpose(1, 2)
-        k_sem = self.to_k_sem(kv_low).reshape(B, Ni, H, Hd).transpose(1, 2)
         v_sem = self.to_v_sem(kv_low).reshape(B, Ni, H, Hd).transpose(1, 2)
-        k_det = self.to_k_det(kv_high).reshape(B, Ni, H, Hd).transpose(1, 2)
         v_det = self.to_v_det(kv_high).reshape(B, Ni, H, Hd).transpose(1, 2)
         q = self.q_norm(q)
-        k_sem, k_det = self.k_norm_sem(k_sem), self.k_norm_det(k_det)
-        if rope is not None:
-            q, k_sem, k_det = rope(q), rope(k_sem), rope(k_det)
+        if self.kv_mode == 'v_only':
+            k = self.k_norm(self.to_k(kv_in).reshape(B, Ni, H, Hd).transpose(1, 2))
+            if rope is not None:
+                q, k = rope(q), rope(k)
+            k_sem = k_det = k
+        else:
+            k_sem = self.k_norm_sem(self.to_k_sem(kv_low).reshape(B, Ni, H, Hd).transpose(1, 2))
+            k_det = self.k_norm_det(self.to_k_det(kv_high).reshape(B, Ni, H, Hd).transpose(1, 2))
+            if rope is not None:
+                q, k_sem, k_det = rope(q), rope(k_sem), rope(k_det)
 
         alpha = torch.sigmoid(self.proj_alpha(t_emb))
 
@@ -579,6 +595,7 @@ class CSGDiT_Segmentation(nn.Module):
         attn_drop=0.1,
         proj_drop=0.1,
         dfca_attn_drop=0.1,
+        dfca_kv_mode='split',
         dino_repo=None,
         dino_weights=None,
         dino_pretrained=True,
@@ -646,7 +663,7 @@ class CSGDiT_Segmentation(nn.Module):
         ])
 
         self.dfca_layers = nn.ModuleList([
-            DFCA(hidden_size, num_heads, attn_drop=dfca_attn_drop)
+            DFCA(hidden_size, num_heads, attn_drop=dfca_attn_drop, kv_mode=dfca_kv_mode)
             for _ in range(depth)
         ])
 

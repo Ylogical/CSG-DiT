@@ -313,11 +313,15 @@ def main():
                                     num_workers=args.num_workers)
     print(f"Test samples: {len(test_loader.dataset)}")
 
-    print(f"Creating model {args.model} @ {args.image_size}x{args.image_size}...")
+    kv_mode = ('v_only' if 'dfca_layers.0.to_k.weight' in ckpt['model_state_dict']
+               else 'split')
+    print(f"Creating model {args.model} @ {args.image_size}x{args.image_size} "
+          f"(DFCA kv_mode={kv_mode})...")
     model = CSGDiT_models[args.model](
         input_size=args.image_size,
         mask_channels=args.mask_channels,
         image_channels=args.image_channels,
+        dfca_kv_mode=kv_mode,
         dino_repo=args.dino_repo,
         dino_pretrained=False,
     ).to(device)
