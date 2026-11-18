@@ -80,7 +80,8 @@ Examples:
                         help='Global batch size, split evenly over the GPUs. '
                              'Default: glas/ph2/synapse=8, monuseg/imid=4')
     parser.add_argument('--epochs', type=int, default=None,
-                        help='Default: synapse=5000, others=10000 (with early stopping)')
+                        help='Default: synapse=5000, others=10000 (early stopping '
+                             'only when a validation split exists: ph2/imid)')
     parser.add_argument('--lr', type=float, default=None,
                         help='Default: 2e-4, monuseg=1e-4')
     parser.add_argument('--gpu', type=int, default=0)

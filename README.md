@@ -158,9 +158,17 @@ Inference detects the mode from the checkpoint.
 
 Checkpoints are saved to `checkpoints/<dataset>_<model>_<timestamp>/` and logs to
 `logs/`. A checkpoint stores the full model state, including the frozen DINOv2
-weights. For binary datasets, evaluate `best_model.pth`. Under the default
-Synapse split, training has no early stopping or validation-based model
-selection; evaluate `final_model.pth`.
+weights. Which checkpoint to evaluate depends on whether the split has a
+validation set:
+
+| Dataset              | Validation set | Training schedule                    | Evaluate           |
+| -------------------- | -------------- | ------------------------------------ | ------------------ |
+| PH2, IMID            | yes            | up to 10,000 epochs, early stopping  | `best_model.pth` (best validation IoU) |
+| GlaS, MoNuSeg        | no (official)  | full 10,000 epochs                   | `final_model.pth`  |
+| Synapse              | no (TransUNet) | full 5,000 epochs                    | `final_model.pth`  |
+
+Without a validation set, early stopping and best-model selection are off and
+no `best_model.pth` is written.
 
 To train on several GPUs, launch with `torchrun`; the batch size stays global
 and is split evenly over the GPUs:
@@ -179,9 +187,11 @@ python train.py --dataset glas --resume checkpoints/<run>/last_model.pth
 
 ```bash
 python inference.py \
-    --checkpoint checkpoints/<run>/best_model.pth \
+    --checkpoint checkpoints/<glas-run>/final_model.pth \
     --dataset glas --save_images
 ```
+
+For PH2 and IMID, pass `checkpoints/<run>/best_model.pth` instead.
 
 Inference follows the paper protocol: EMA weights, deterministic DDIM with
 `--ddim_steps 20` and `--K 25` averaged trajectories (use `--K 1` for faster
@@ -224,6 +234,6 @@ For MoNuSeg-to-TNBC evaluation without fine-tuning:
 
 ```bash
 python inference.py \
-    --checkpoint checkpoints/<monuseg-run>/best_model.pth \
+    --checkpoint checkpoints/<monuseg-run>/final_model.pth \
     --dataset tnbc
 ```
