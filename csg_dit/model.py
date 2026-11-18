@@ -279,8 +279,10 @@ class UBAM(nn.Module):
         u = F.interpolate(uncertainty, size=size, mode='bilinear', align_corners=False)
         b = F.interpolate(boundary, size=size, mode='bilinear', align_corners=False)
         time = self.t_gate_proj(e_t)[:, :, None, None].expand(-1, -1, *size)
-        gate = 1.0 + self.alpha * self.gate_conv(torch.cat([u, b, time], dim=1)).tanh()
-        return out * gate
+        h = self.gate_conv(torch.cat([u, b, time], dim=1))
+        h = h - h.mean(dim=(-2, -1), keepdim=True)
+        gate = 1.0 + self.alpha * h.tanh()
+        return out * gate, gate
 
 
 class HierarchicalConditionEncoder(nn.Module):
@@ -368,8 +370,9 @@ class UNetDecoder(nn.Module):
         x = self.stage0(x)
 
         def _joint(idx, ubam):
-            state = ubam(mask_skips[idx], t_emb, uncertainty, boundary)
-            return torch.cat([state, image_skips[idx]], dim=1)
+            state, gate = ubam(mask_skips[idx], t_emb, uncertainty, boundary)
+            image = image_skips[idx] * (2.0 - gate).clamp(min=0.0)
+            return torch.cat([state, image], dim=1)
 
         x = self.up1(x, _joint(2, self.ubam3))
         x = self.up2(x, _joint(1, self.ubam2))
@@ -570,9 +573,11 @@ class CSGDiT_Segmentation(nn.Module):
         dino_weights=None,
         dino_pretrained=True,
         x0_softmax=None,
+        ubam_kappa=4.0,
     ):
         super().__init__()
         self.mask_channels = mask_channels
+        self.ubam_kappa = ubam_kappa
         if x0_softmax is None:
             x0_softmax = (mask_channels > 1)
         if x0_softmax and mask_channels == 1:
@@ -712,14 +717,21 @@ class CSGDiT_Segmentation(nn.Module):
             boundary = magnitude / (magnitude.amax(dim=(-2, -1), keepdim=True) + 1e-6)
         return image_tokens, image_skips, context, boundary
 
-    def compute_uncertainty(self, noisy_mask):
-        with torch.amp.autocast(device_type=noisy_mask.device.type, enabled=False):
-            return 1.0 - noisy_mask.float().tanh().abs().mean(dim=1, keepdim=True)
+    def compute_uncertainty(self, logits):
+        with torch.amp.autocast(device_type=logits.device.type, enabled=False):
+            o = logits.detach().float()
+            if self.x0_softmax:
+                top2 = o.softmax(dim=1).topk(2, dim=1).values
+                return 1.0 - (top2[:, 0:1] - top2[:, 1:2])
+            return 1.0 - torch.tanh(o / self.ubam_kappa).abs().mean(dim=1, keepdim=True)
 
-    def forward(self, x_mask_noisy, t, image_cond, condition=None):
+    def forward(self, x_mask_noisy, t, image_cond, uncertainty=None, condition=None,
+                return_logits=False):
         if condition is None:
             condition = self.encode_condition(image_cond)
         image_tokens, image_skips, context, boundary = condition
+        if uncertainty is None:
+            uncertainty = torch.ones_like(boundary)
 
         t_emb = self.t_embedder(t)
         c = self.cond_mlp(torch.cat([t_emb, context], dim=-1))
@@ -732,9 +744,10 @@ class CSGDiT_Segmentation(nn.Module):
             mask_tokens = mask_tokens + dfca(mask_tokens, image_tokens, c, t_emb,
                                              rope=self.feat_rope)
 
-        uncertainty = self.compute_uncertainty(x_mask_noisy)
-        return self._x0_act(self.final_layer(
-            mask_tokens, c, mask_skips, image_skips, t_emb, uncertainty, boundary))
+        logits = self.final_layer(mask_tokens, c, mask_skips, image_skips,
+                                  t_emb, uncertainty, boundary)
+        x0 = self._x0_act(logits)
+        return (x0, logits) if return_logits else x0
 
     def _x0_act(self, z):
         if self.x0_softmax:

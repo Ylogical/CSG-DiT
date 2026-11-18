@@ -32,7 +32,7 @@ _DATASET_DEFAULTS = {
                 'lr': 2e-4, 'epochs': 10000, 'warmup_epochs': 50,
                 'patience': 20, 'metrics_eval_freq': 30, 'es_min_epochs': 0,
                 'weight_decay': 0.05, 'attn_drop': 0.1, 'proj_drop': 0.1},
-    'monuseg': {'image_size': 512, 'model': 'CSGDiT-B/32', 'batch_size': 4,
+    'monuseg': {'image_size': 512, 'model': 'CSGDiT-B/16', 'batch_size': 4,
                 'lr': 1e-4, 'epochs': 10000, 'warmup_epochs': 60,
                 'patience': 20, 'metrics_eval_freq': 25, 'es_min_epochs': 0,
                 'weight_decay': 0.05, 'attn_drop': 0.1, 'proj_drop': 0.1},
@@ -40,7 +40,7 @@ _DATASET_DEFAULTS = {
                 'lr': 2e-4, 'epochs': 5000, 'warmup_epochs': 30,
                 'patience': 15, 'metrics_eval_freq': 20, 'es_min_epochs': 0,
                 'weight_decay': 0.02, 'attn_drop': 0.05, 'proj_drop': 0.05,
-                'ce_weight': 0.5},
+                'ce_weight': 1.0},
 }
 
 for _cfg in _DATASET_DEFAULTS.values():
@@ -55,6 +55,11 @@ _COMMON = {
     'ema_decay': 0.9999,
     'es_delta': 1e-4,
     'val_seed': 1234,
+    'ubam_kappa': 4.0,
+    'recycle_prob': 0.5,
+    'recycle_dt_min': 10,
+    'recycle_dt_max': 100,
+    'bg_weight': 0.1,
 }
 
 
@@ -94,6 +99,10 @@ Examples:
                         help='Local checkout of the official DINOv2 repository (offline use)')
     parser.add_argument('--dino_weights', type=str, default=None,
                         help='Local dinov2_vitb14_pretrain.pth (offline use)')
+    parser.add_argument('--recycle_prob', type=float, default=None, help='rho (default 0.5)')
+    parser.add_argument('--recycle_dt_min', type=int, default=None, help='Delta_min (default 10)')
+    parser.add_argument('--recycle_dt_max', type=int, default=None, help='Delta_max (default 100)')
+    parser.add_argument('--ubam_kappa', type=float, default=None, help='kappa_u (default 4)')
     args = parser.parse_args()
 
     cfg = dict(_COMMON, **_DATASET_DEFAULTS[args.dataset])
@@ -133,6 +142,24 @@ def setup_distributed(args):
     return device
 
 
+def compute_class_weights(dataset, num_classes, bg_weight):
+    counts = np.zeros(num_classes)
+    for path, *_ in dataset.samples:
+        with np.load(path) as data:
+            counts += np.bincount(data['label'].ravel().astype(np.int64), minlength=num_classes)
+    freq = counts / counts.sum()
+    weights = 1.0 / np.sqrt(np.maximum(freq, 1e-12))
+    weights[1:] /= weights[1:].mean()
+    weights[0] = bg_weight
+    return torch.tensor(weights, dtype=torch.float32), freq
+
+
+def _loss_kwargs(args):
+    return dict(dice_weight=args.dice_weight, ce_weight=args.ce_weight,
+                class_weights=args.class_weights, recycle_prob=args.recycle_prob,
+                recycle_dt_min=args.recycle_dt_min, recycle_dt_max=args.recycle_dt_max)
+
+
 def train_one_epoch(model, diffusion, train_loader, optimizer, device, epoch,
                     writer, args, ema):
     model.train()
@@ -144,11 +171,7 @@ def train_one_epoch(model, diffusion, train_loader, optimizer, device, epoch,
     pbar = tqdm(train_loader, desc=f'Epoch {epoch + 1}/{args.epochs}',
                 disable=not args.is_main)
     for step, batch in enumerate(pbar):
-        loss, _, _ = compute_loss(
-            model, diffusion, batch, device,
-            dice_weight=args.dice_weight,
-            ce_weight=args.ce_weight,
-        )
+        loss, _, _ = compute_loss(model, diffusion, batch, device, **_loss_kwargs(args))
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -174,11 +197,7 @@ def evaluate(model, diffusion, val_loader, device, epoch, writer, args):
     model.eval()
     total_loss = 0.0
     for batch in tqdm(val_loader, desc='Evaluating', leave=False):
-        loss, _, _ = compute_loss(
-            model, diffusion, batch, device,
-            dice_weight=args.dice_weight,
-            ce_weight=args.ce_weight,
-        )
+        loss, _, _ = compute_loss(model, diffusion, batch, device, **_loss_kwargs(args))
         total_loss += loss.item()
     avg_loss = total_loss / len(val_loader)
     writer.add_scalar('eval/loss', avg_loss, epoch)
@@ -259,6 +278,8 @@ def main():
           f"{args.patience * args.metrics_eval_freq} epochs w/o improvement)")
     print(f"EMA: decay={args.ema_decay}"
           f" | Frozen pretrained DINOv2-B/14; remaining modules trained from scratch")
+    print(f"UBAM: kappa_u={args.ubam_kappa} | Recycling: rho={args.recycle_prob}, "
+          f"Delta in [{args.recycle_dt_min}, {args.recycle_dt_max}]")
     print("=" * 60)
 
     if device.type == 'cuda':
@@ -291,6 +312,14 @@ def main():
               "model to evaluate. Run `python -m csg_dit.data --val_cases N` to "
               "hold cases out instead.")
 
+    args.class_weights = None
+    if args.mask_channels > 1 and args.ce_weight > 0.0:
+        args.class_weights, freq = compute_class_weights(
+            train_loader.dataset, args.mask_channels, args.bg_weight)
+        print("CE class weights (pixel frequency -> weight):")
+        for c in range(args.mask_channels):
+            print(f"  class {c}: {freq[c]:9.5%} -> {args.class_weights[c]:.3f}")
+
     print("Creating model...")
     model = CSGDiT_models[args.model](
         input_size=args.image_size,
@@ -302,6 +331,7 @@ def main():
         dino_repo=args.dino_repo,
         dino_weights=args.dino_weights,
         dino_pretrained=args.resume is None,
+        ubam_kappa=args.ubam_kappa,
     ).to(device)
     if args.distributed:
         model = DDP(model, device_ids=[device.index])

@@ -42,15 +42,32 @@ class DiffusionSchedule:
         sqrt_1m_ac = self._extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
         return sqrt_ac * x_start + sqrt_1m_ac * noise, noise
 
+    def ddim_step(self, x_s, x0_hat, s, t):
+        alpha_s = self._extract(self.alphas_cumprod, s, x_s.shape)
+        alpha_t = self._extract(self.alphas_cumprod, t, x_s.shape)
+        eps_hat = (x_s - alpha_s.sqrt() * x0_hat) / (1.0 - alpha_s).sqrt()
+        return alpha_t.sqrt() * x0_hat + (1.0 - alpha_t).sqrt() * eps_hat
+
+    @torch.no_grad()
+    def recycle(self, model, x0, image, t, dt_min=10, dt_max=100):
+        net = model.module if hasattr(model, 'module') else model
+        delta = torch.randint(dt_min, dt_max + 1, t.shape, device=t.device)
+        s = (t + delta).clamp(max=self.num_timesteps - 1)
+        x_s, _ = self.q_sample(x0, s)
+        x0_hat, logits = net(x_s, s, image, return_logits=True)
+        x_t = self.ddim_step(x_s, x0_hat.clamp(-1.0, 1.0), s, t)
+        return x_t, net.compute_uncertainty(logits)
+
     @torch.no_grad()
     def ddim_sample(self, model, shape, image_cond, device,
                     ddim_steps=20, eta=0.0, progress=False, generator=None):
         if not 1 <= ddim_steps <= self.num_timesteps:
             raise ValueError('ddim_steps must lie between 1 and num_timesteps')
         batch_size = shape[0]
+        net = model.module if hasattr(model, 'module') else model
 
-        condition = (model.encode_condition(image_cond)
-                     if hasattr(model, 'encode_condition') else None)
+        condition = net.encode_condition(image_cond)
+        uncertainty = None
 
         ddim_timesteps = np.rint(np.linspace(0, self.num_timesteps - 1,
                                              ddim_steps)).astype(np.int64)
@@ -67,11 +84,10 @@ class DiffusionSchedule:
         for i, t in enumerate(steps):
             t_batch = torch.full((batch_size,), t, device=device, dtype=torch.long)
 
-            if condition is None:
-                prediction = model(x_t, t_batch, image_cond)
-            else:
-                prediction = model(x_t, t_batch, image_cond, condition=condition)
+            prediction, logits = net(x_t, t_batch, image_cond, uncertainty=uncertainty,
+                                     condition=condition, return_logits=True)
             pred_x0 = prediction.clamp(-1.0, 1.0)
+            uncertainty = net.compute_uncertainty(logits)
 
             alpha_t = self._extract(self.alphas_cumprod, t_batch, x_t.shape)
             if i < len(ddim_timesteps) - 1:
@@ -103,14 +119,24 @@ def dice_loss(pred, target, smooth=1e-5):
 
 
 def compute_loss(model, diffusion, batch, device, use_dice=True, dice_weight=1.0,
-                 ce_weight=0.0):
+                 ce_weight=0.0, class_weights=None,
+                 recycle_prob=0.0, recycle_dt_min=10, recycle_dt_max=100):
     image = batch['image'].to(device)
     mask  = batch['mask'].to(device)
+    batch_size = mask.shape[0]
 
-    t = torch.randint(0, diffusion.num_timesteps, (mask.shape[0],), device=device).long()
+    t = torch.randint(0, diffusion.num_timesteps, (batch_size,), device=device).long()
     x_t, _ = diffusion.q_sample(mask, t)
+    uncertainty = torch.ones_like(mask[:, :1])
 
-    pred_x0 = model(x_t, t, image)
+    recycled = torch.rand(batch_size, device=device) < recycle_prob
+    if recycled.any():
+        x_t, uncertainty = x_t.clone(), uncertainty.clone()
+        x_t[recycled], uncertainty[recycled] = diffusion.recycle(
+            model, mask[recycled], image[recycled], t[recycled],
+            recycle_dt_min, recycle_dt_max)
+
+    pred_x0 = model(x_t, t, image, uncertainty=uncertainty)
 
     loss = F.mse_loss(pred_x0, mask)
 
@@ -126,7 +152,8 @@ def compute_loss(model, diffusion, batch, device, use_dice=True, dice_weight=1.0
                                  '(mask_channels > 1) and the softmax x0 head')
             label = batch.get('label_idx')
             label = (mask.argmax(dim=1) if label is None else label.to(device)).long()
+            weight = None if class_weights is None else class_weights.to(device)
             loss = loss + ce_weight * F.nll_loss(torch.log(pred_01.clamp_min(1e-7)),
-                                                 label)
+                                                 label, weight=weight)
 
     return loss, pred_x0, mask

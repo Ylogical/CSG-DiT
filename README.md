@@ -77,9 +77,11 @@ background 0 and foreground 255; merge instance annotations into foreground
 masks. Supported formats are PNG, JPEG, BMP and TIFF. The loader resizes images
 and masks to the dataset's configured input size.
 
-Prepare fixed train/validation/test splits before training. The paper uses a
-6:2:2 split, with patient-level separation for GlaS. TNBC is used only for
-cross-dataset evaluation and requires only `test/images/` and `test/masks/`.
+Prepare fixed train/validation/test splits before training. GlaS and MoNuSeg
+use their official splits (85/80 and 30/14 training/test images) with an empty
+`val/`; PH2 and IMID are split per image with seed 42 into 120/40/40 and
+240/80/80 training/validation/test images. TNBC is used only for cross-dataset
+evaluation and requires only `test/images/` and `test/masks/`.
 
 Synapse uses the TransUNet files (18 training cases and 12 test volumes;
 background and 8 organ classes):
@@ -110,7 +112,38 @@ Training supports `glas`, `ph2`, `imid`, `monuseg` and `synapse`; per-dataset
 settings are in `_DATASET_DEFAULTS` and shared settings in `_COMMON` in
 `train.py`. The command line only exposes common options: `--batch_size`,
 `--epochs`, `--lr`, `--gpu`, `--num_workers`, `--seed`, `--resume`,
-`--save_dir`, `--log_dir`, `--dfca_kv_mode`, `--dino_repo` and `--dino_weights`.
+`--save_dir`, `--log_dir`, `--dfca_kv_mode`, `--dino_repo`, `--dino_weights`,
+`--recycle_prob`, `--recycle_dt_min`, `--recycle_dt_max` and `--ubam_kappa`.
+
+### State guidance (UBAM) and recycling
+
+The implementation follows Sec. III-F, III-H and Algorithm 1 of the paper:
+
+- **Uncertainty (Eq. 18)** is computed from the pre-activation decoder output
+  `o` of the prediction that built the current state `x_t`, not from `x_t`
+  itself: `u = 1 - (p_(1) - p_(2))` for multi-class masks and
+  `u = 1 - mean_c |tanh(o_c / kappa_u)|` (`kappa_u = 4`) for binary masks
+  (`CSGDiT_Segmentation.compute_uncertainty`). Without a previous estimate,
+  `u == 1`.
+- **Inference** (`DiffusionSchedule.ddim_sample`) starts with `u == 1` and,
+  after every DDIM step, recomputes `u` from that step's logits and passes it
+  to the next step.
+- **Training** (`compute_loss`) recycles each sample with probability
+  `rho = 0.5`: `Delta ~ U{10, ..., 100}`, `s = min(t + Delta, T)`, a
+  gradient-free prediction from the forward-noised `x_s` (with `u == 1`) gives
+  `x_t` by one deterministic DDIM step from `s` to `t` and `u_t` by Eq. 18
+  (`DiffusionSchedule.recycle`). Other samples keep the forward-noised `x_t`
+  with `u == 1`. The target is always the ground-truth mask.
+- **Modulation (Eqs. 17, 20)**: a timestep FiLM adapts the mask-state skip
+  channel-wise; the gate `g = 1 + delta * tanh(h - mean(h))` reweights it
+  spatially, and the image skip is reweighted complementarily by
+  `max(2 - g, 0)` before both enter the decoder.
+
+`--recycle_prob 0` trains on forward-noised states only (`u == 1` throughout).
+
+The multi-class (Synapse) objective adds a class-weighted cross-entropy with
+`lambda_CE = 1`: foreground classes are weighted by the inverse square root of
+their training pixel frequency (normalised to mean 1), the background by 0.1.
 
 `--dfca_kv_mode` selects how DFCA builds its keys. The default, `split`,
 follows the paper: each frequency band provides its own keys and values.
@@ -162,8 +195,30 @@ For Synapse volume-level evaluation:
 ```bash
 python inference.py \
     --checkpoint checkpoints/<synapse-run>/final_model.pth \
-    --dataset synapse
+    --dataset synapse --spacing_json synapse_spacing.json
 ```
+
+`--spacing_json` maps each test case to its voxel spacing `[z, y, x]` in mm,
+read from the original BTCV NIfTI headers (the TransUNet `.h5` files store no
+spacing), e.g. `{"case0001": [3.0, 0.76, 0.76], ...}`. With it, HD95 is
+reported in mm; without it, in voxels.
+
+### Evaluation rules
+
+- **HD95** pools the symmetric surface distances of both masks and takes the
+  95th percentile (the `medpy.metric.binary.hd95` definition used by
+  TransUNet). It is computed per image (2D datasets, in pixels at the
+  evaluation resolution) or per volume and organ (Synapse, at the native
+  label resolution).
+- **Empty ground truth** (e.g. the gallbladder of Synapse case0035): DSC and
+  HD95 are undefined, so the pair is excluded from the means and listed in the
+  output, together with any false positives predicted there.
+- **Missed target** (empty prediction, non-empty ground truth): DSC is 0 and
+  HD95 is the diagonal of the image or volume, never 0.
+
+These rules differ from TransUNet's `calculate_metric_percase`, which scores
+any degenerate case with HD95 = 0 and, for an empty ground truth, gives DSC = 1
+to a false positive and DSC = 0 to a correct empty prediction.
 
 For MoNuSeg-to-TNBC evaluation without fine-tuning:
 

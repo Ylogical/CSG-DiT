@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import argparse
 
@@ -11,7 +12,7 @@ from csg_dit.model import CSGDiT_models
 from csg_dit.data import get_dataloader, get_num_classes, SynapseDataset
 from csg_dit.diffusion import DiffusionSchedule
 from csg_dit.utils import set_seed
-from csg_dit.metrics import (SCIPY_AVAILABLE, compute_metrics, compute_hd95,
+from csg_dit.metrics import (SCIPY_AVAILABLE, compute_metrics, compute_hd95, overlap_dice,
                              compute_ged, compute_ece, count_params, estimate_gflops)
 
 
@@ -43,6 +44,7 @@ def run_inference(model, diffusion, test_loader, device, args):
     sample_idx = 0
     t_start = time.perf_counter()
     hd95_overhead = 0.0
+    n_gt_empty = n_fp_on_empty = n_missed = 0
 
     for batch in tqdm(test_loader, desc='Running inference'):
         images = batch['image'].to(device)
@@ -64,16 +66,19 @@ def run_inference(model, diffusion, test_loader, device, args):
         for i in range(B):
             pred_b, gt_b = pred_np[i], gt_np[i]
 
-            iou, dice, prec, rec, acc = compute_metrics(pred_b, gt_b)
-            ious.append(iou); dices.append(dice)
-            precs.append(prec); recs.append(rec); accs.append(acc)
+            if not gt_b.any():
+                n_gt_empty += 1
+                n_fp_on_empty += int(pred_b.any())
+            else:
+                iou, dice, prec, rec, acc = compute_metrics(pred_b, gt_b)
+                ious.append(iou); dices.append(dice)
+                precs.append(prec); recs.append(rec); accs.append(acc)
 
-            if not args.skip_hd95 and SCIPY_AVAILABLE:
-                _t = time.perf_counter()
-                h = compute_hd95(pred_b, gt_b)
-                if h is not None:
-                    all_hd95.append(h)
-                hd95_overhead += time.perf_counter() - _t
+                if not args.skip_hd95 and SCIPY_AVAILABLE:
+                    _t = time.perf_counter()
+                    n_missed += int(not pred_b.any())
+                    all_hd95.append(compute_hd95(pred_b, gt_b))
+                    hd95_overhead += time.perf_counter() - _t
 
             if args.K > 1:
                 all_ged.append(compute_ged([kb[i] for kb in k_binary], gt_b))
@@ -106,6 +111,9 @@ def run_inference(model, diffusion, test_loader, device, args):
         'hd95': float(np.mean(all_hd95)) if all_hd95 else None,
         'ged':  float(np.mean(all_ged)) if all_ged else None,
         'ece':  compute_ece(np.concatenate(all_prob), np.concatenate(all_gt_flat)),
+        'n_gt_empty':    n_gt_empty,
+        'n_fp_on_empty': n_fp_on_empty,
+        'n_missed':      n_missed,
         'n_images':   sample_idx,
         'total_sec':  total_time,
         'per_image_ms': total_time / max(sample_idx, 1) * 1000,
@@ -178,7 +186,7 @@ def run_inference_multiclass(model, diffusion, test_loader, device, args):
             for c in range(1, num_classes):
                 pc, gc = (p == c), (g == c)
                 inter, p_sum, g_sum = float((pc & gc).sum()), float(pc.sum()), float(gc.sum())
-                if p_sum == 0 and g_sum == 0:
+                if g_sum == 0:
                     continue
                 cls_iou.append(inter / (p_sum + g_sum - inter + 1e-6))
                 cls_dice.append(2 * inter / (p_sum + g_sum + 1e-6))
@@ -210,21 +218,28 @@ def run_inference_multiclass(model, diffusion, test_loader, device, args):
     do_hd95 = (not args.skip_hd95) and SCIPY_AVAILABLE
     dsc_per_organ  = defaultdict(list)
     hd95_per_organ = defaultdict(list)
-    n_degenerate = 0
+    gt_empty_pairs, fp_on_empty_pairs, missed_pairs = [], [], []
+    n_cases = 0
 
     for cid in tqdm(sorted(case_slices), desc='Case-wise 3D metrics'):
         items    = sorted(case_slices[cid], key=lambda it: it[0])
         pred_vol = np.stack([it[1] for it in items], axis=0)
         gt_vol   = np.stack([it[2] for it in items], axis=0)
+        spacing  = args.spacing[cid] if args.spacing else None
+        n_cases += 1
         for c in range(1, num_classes):
             pc, gc = (pred_vol == c), (gt_vol == c)
-            inter, p_sum, g_sum = float((pc & gc).sum()), float(pc.sum()), float(gc.sum())
-            dsc_per_organ[c].append(1.0 if p_sum + g_sum == 0
-                                    else 2 * inter / (p_sum + g_sum + 1e-6))
+            d = overlap_dice(pc, gc)
+            if d is None:
+                gt_empty_pairs.append((cid, organ_names[c]))
+                if pc.any():
+                    fp_on_empty_pairs.append((cid, organ_names[c]))
+                continue
+            dsc_per_organ[c].append(d)
             if do_hd95:
-                if not pc.any() or not gc.any():
-                    n_degenerate += 1
-                hd95_per_organ[c].append(compute_hd95(pc, gc))
+                if not pc.any():
+                    missed_pairs.append((cid, organ_names[c]))
+                hd95_per_organ[c].append(compute_hd95(pc, gc, spacing))
     case_slices.clear()
 
     organ_dsc  = {c: float(np.mean(v)) for c, v in dsc_per_organ.items()}
@@ -236,8 +251,11 @@ def run_inference_multiclass(model, diffusion, test_loader, device, args):
         'organ_dsc':  organ_dsc,
         'organ_hd95': organ_hd95,
         'organ_names': organ_names,
-        'n_cases': len(dsc_per_organ[1]) if dsc_per_organ else 0,
-        'n_hd95_degenerate': n_degenerate,
+        'organ_n':    {c: len(v) for c, v in dsc_per_organ.items()},
+        'n_cases': n_cases,
+        'gt_empty_pairs':    gt_empty_pairs,
+        'fp_on_empty_pairs': fp_on_empty_pairs,
+        'missed_pairs':      missed_pairs,
         'slice_iou':  float(np.mean(slice_iou))  if slice_iou  else 0.0,
         'slice_dice': float(np.mean(slice_dice)) if slice_dice else 0.0,
         'slice_sen':  float(np.mean(slice_sen))  if slice_sen  else 0.0,
@@ -246,6 +264,34 @@ def run_inference_multiclass(model, diffusion, test_loader, device, args):
         'total_sec':  total_time,
         'per_image_ms': total_time / max(sample_idx, 1) * 1000,
     }
+
+
+_DROPPED_PREFIXES = ('aux_token_head.',)
+_EXPERIMENT_FLAGS = ('use_ubam', 'ubam_self_cond', 'ubam_mask_only', 'ubam_gate_center',
+                     'ubam_complement', 'recycle_prob', 'use_pbdf', 'no_dual_token',
+                     'xattn_qk_norm', 'xattn_rope')
+_EXPERIMENT_RENAME = {'final_layer.tm': 'final_layer.ubam',
+                      'image_embedder.': 'image_encoder.',
+                      'image_global_weight.': 'pool_weight.',
+                      'ubam_sobel': 'sobel'}
+
+
+def _rename(key):
+    for old, new in _EXPERIMENT_RENAME.items():
+        if key.startswith(old):
+            return new + key[len(old):]
+    return key
+
+
+def convert_experiment_checkpoint(ckpt, cfg):
+    missing = [f for f in _EXPERIMENT_FLAGS if not cfg.get(f)]
+    if missing or cfg.get('image_encoder') != 'cnn_dinov2_cat':
+        raise RuntimeError(f'Checkpoint was not trained with the CSG-DiT method: {missing}')
+    for field in ('model_state_dict', 'ema_shadow'):
+        if field in ckpt:
+            ckpt[field] = {_rename(k): v for k, v in ckpt[field].items()}
+    return dict(cfg, model=cfg['model'].replace('JiT-Seg', 'CSGDiT'),
+                ubam_kappa=cfg.get('ubam_sc_tau', 4.0))
 
 
 def parse_args():
@@ -268,7 +314,14 @@ def parse_args():
     p.add_argument('--dino_repo',   type=str, default=None,
                    help='Local checkout of the official DINOv2 repository (offline use); '
                         'the DINOv2 weights themselves are restored from the checkpoint')
+    p.add_argument('--spacing_json', type=str, default=None,
+                   help='Synapse voxel spacing in mm, {"case0001": [z, y, x], ...}; '
+                        'without it HD95 is in voxels')
     args = p.parse_args()
+    args.spacing = None
+    if args.spacing_json:
+        with open(args.spacing_json, encoding='utf-8') as f:
+            args.spacing = json.load(f)
     args.eta = 0.0
     args.threshold = 0.0
     args.use_ema = True
@@ -294,9 +347,11 @@ def main():
             print(f"  {k}: {v}")
         print()
 
-    if cfg.get('model', '').startswith(('FAS', 'JiT')):
+    if cfg.get('model', '').startswith('FAS'):
         raise RuntimeError('This checkpoint predates CSG-DiT (no HCSE / UBAM); '
                            'use a CSG-DiT checkpoint.')
+    if cfg.get('model', '').startswith('JiT'):
+        cfg = convert_experiment_checkpoint(ckpt, cfg)
     args.model          = cfg.get('model', 'CSGDiT-B/16')
     args.num_timesteps  = cfg.get('num_timesteps', 200)
     args.beta_schedule  = cfg.get('beta_schedule', 'cosine')
@@ -324,18 +379,16 @@ def main():
         dfca_kv_mode=kv_mode,
         dino_repo=args.dino_repo,
         dino_pretrained=False,
+        ubam_kappa=cfg.get('ubam_kappa') or 4.0,
     ).to(device)
 
-    # Checkpoints from earlier code versions may hold an auxiliary token head
-    # that is not part of CSG-DiT; it never affects inference, so drop it.
-    legacy = 'aux_token_head.'
     state_dict = {k: v for k, v in ckpt['model_state_dict'].items()
-                  if not k.startswith(legacy)}
+                  if not k.startswith(_DROPPED_PREFIXES)}
     model.load_state_dict(state_dict, strict=True)
     if 'ema_shadow' in ckpt:
         print("Loading EMA weights...")
         ema_shadow = {k: v for k, v in ckpt['ema_shadow'].items()
-                      if not k.startswith(legacy)}
+                      if not k.startswith(_DROPPED_PREFIXES)}
         model_keys = {n for n, p in model.named_parameters() if p.requires_grad}
         if model_keys != set(ema_shadow.keys()):
             raise RuntimeError("The EMA weights do not match the model structure.")
@@ -368,23 +421,30 @@ def main():
         f"GFLOPs:    {gflops:.2f}" if gflops is not None else "GFLOPs:    N/A",
     ]
 
+    def _pairs(pairs):
+        return ', '.join(f'{cid}/{organ}' for cid, organ in pairs) or 'none'
+
     if multiclass:
         names = r['organ_names']
+        unit = 'mm' if args.spacing else 'voxels'
         lines = header + [
             f"Cases:     {r['n_cases']} volumes, scored at the native label resolution",
             "",
             "Case-wise 3D (the numbers reported in the paper):",
             f"  DSC:     {r['dice'] * 100:.2f} %",
-            (f"  HD95:    {r['hd95']:.2f} voxels "
-             f"({r['n_hd95_degenerate']} of {r['n_cases'] * (args.mask_channels - 1)} "
-             f"(case, organ) pairs degenerate, counted as 0)"
+            (f"  HD95:    {r['hd95']:.2f} {unit}"
              if r['hd95'] is not None
              else "  HD95:    N/A (needs scipy, or disabled with --skip_hd95)"),
             "",
-            "  Per organ (DSC % / HD95 voxels):",
+            f"  Empty ground truth (excluded):   {_pairs(r['gt_empty_pairs'])}",
+            f"  False positives on empty GT:     {_pairs(r['fp_on_empty_pairs'])}",
+            f"  Missed organs (HD95 = diagonal): {_pairs(r['missed_pairs'])}",
+            "",
+            f"  Per organ (DSC % / HD95 {unit} / number of cases):",
         ] + [
             f"    {names[c]:<6} {r['organ_dsc'][c] * 100:6.2f}" +
-            (f" / {r['organ_hd95'][c]:7.2f}" if c in r['organ_hd95'] else "")
+            (f" / {r['organ_hd95'][c]:7.2f}" if c in r['organ_hd95'] else "") +
+            f" / n={r['organ_n'][c]}"
             for c in sorted(r['organ_dsc'])
         ] + [
             "",
@@ -405,6 +465,9 @@ def main():
             f"Precision: {r['prec']:.4f}",
             (f"HD95:      {r['hd95']:.2f} px" if r['hd95'] is not None
              else "HD95:      N/A (needs scipy, or disabled with --skip_hd95)"),
+            f"Images with empty ground truth (excluded): {r['n_gt_empty']}"
+            f" (with false positives: {r['n_fp_on_empty']})",
+            f"Missed targets (HD95 = image diagonal):    {r['n_missed']}",
             (f"GED:       {r['ged']:.4f}" if r['ged'] is not None
              else "GED:       N/A (needs --K > 1)"),
             f"ECE:       {r['ece']:.4f}",

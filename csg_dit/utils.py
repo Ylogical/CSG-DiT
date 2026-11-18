@@ -107,6 +107,12 @@ def save_checkpoint(model, optimizer, scheduler, epoch, loss, save_path,
             'attn_drop': args.attn_drop,
             'proj_drop': args.proj_drop,
             'weight_decay': args.weight_decay,
+            'dfca_kv_mode': args.dfca_kv_mode,
+            'ubam_kappa': args.ubam_kappa,
+            'recycle_prob': args.recycle_prob,
+            'recycle_dt_min': args.recycle_dt_min,
+            'recycle_dt_max': args.recycle_dt_max,
+            'ce_weight': args.ce_weight,
         }
     if ema is not None:
         checkpoint['ema_shadow'] = ema.shadow

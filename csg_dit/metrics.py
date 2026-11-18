@@ -26,28 +26,44 @@ def compute_metrics(pred_binary, gt_binary):
     return iou, dice, precision, recall, acc
 
 
-def _surface_distances(pred, gt):
+def _surface_distances(pred, gt, spacing=None):
     conn = generate_binary_structure(pred.ndim, 1)
     pred_border = pred ^ binary_erosion(pred, structure=conn, iterations=1)
     gt_border   = gt   ^ binary_erosion(gt,   structure=conn, iterations=1)
-    return distance_transform_edt(~gt_border)[pred_border]
+    return distance_transform_edt(~gt_border, sampling=spacing)[pred_border]
 
 
-def compute_hd95(pred, gt):
+def max_distance(shape, spacing=None):
+    spacing = np.ones(len(shape)) if spacing is None else np.asarray(spacing, dtype=float)
+    return float(np.linalg.norm(np.asarray(shape) * spacing))
+
+
+def compute_hd95(pred, gt, spacing=None):
     if not SCIPY_AVAILABLE:
         return None
     pred = np.asarray(pred).astype(bool)
     gt   = np.asarray(gt).astype(bool)
-    if not pred.any() or not gt.any():
-        return 0.0
+    if not gt.any():
+        return None
+    if not pred.any():
+        return max_distance(gt.shape, spacing)
 
     idx = np.nonzero(pred | gt)
     slicer = tuple(slice(max(int(i.min()) - 1, 0), min(int(i.max()) + 2, s))
                    for i, s in zip(idx, pred.shape))
     pred, gt = pred[slicer], gt[slicer]
 
-    sds = np.hstack((_surface_distances(pred, gt), _surface_distances(gt, pred)))
+    sds = np.hstack((_surface_distances(pred, gt, spacing),
+                     _surface_distances(gt, pred, spacing)))
     return float(np.percentile(sds, 95))
+
+
+def overlap_dice(pred, gt):
+    pred = np.asarray(pred).astype(bool)
+    gt   = np.asarray(gt).astype(bool)
+    if not gt.any():
+        return None
+    return 2.0 * (pred & gt).sum() / (pred.sum() + gt.sum())
 
 
 def _dice_dist(a, b):
@@ -79,6 +95,8 @@ def binary_slice_metrics(pred_bin, gt_bin, out):
     for i in range(pred_bin.shape[0]):
         p = pred_bin[i].reshape(-1)
         g = gt_bin[i].reshape(-1)
+        if g.sum().item() == 0:
+            continue
         tp = (p * g).sum().item()
         fp = (p * (1 - g)).sum().item()
         fn = ((1 - p) * g).sum().item()
@@ -96,7 +114,7 @@ def multiclass_slice_metrics(pred_idx, gt_idx, num_classes, out):
         for c in range(1, num_classes):
             pc, gc = (p == c), (g == c)
             inter, p_sum, g_sum = (pc & gc).sum().item(), pc.sum().item(), gc.sum().item()
-            if p_sum == 0 and g_sum == 0:
+            if g_sum == 0:
                 continue
             cls_iou.append(inter / (p_sum + g_sum - inter + 1e-6))
             cls_dice.append(2 * inter / (p_sum + g_sum + 1e-6))
